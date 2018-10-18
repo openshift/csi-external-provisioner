@@ -42,6 +42,7 @@ import (
 const (
 	secretNameKey      = "csiProvisionerSecretName"
 	secretNamespaceKey = "csiProvisionerSecretNamespace"
+	defaultFSType      = "ext4"
 )
 
 // CSIProvisioner struct
@@ -291,6 +292,17 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 	for k, v := range rep.Volume.Attributes {
 		volumeAttributes[k] = v
 	}
+
+	fsType := ""
+	for k, v := range options.Parameters {
+		switch strings.ToLower(k) {
+		case "fstype":
+			fsType = v
+		}
+	}
+	if len(fsType) == 0 {
+		fsType = defaultFSType
+	}
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: share,
@@ -306,6 +318,7 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 				CSI: &v1.CSIPersistentVolumeSource{
 					Driver:           driverName,
 					VolumeHandle:     p.volumeIdToHandle(rep.Volume.Id),
+					FSType:           fsType,
 					VolumeAttributes: volumeAttributes,
 				},
 			},
