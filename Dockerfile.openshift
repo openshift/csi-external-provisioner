@@ -10,4 +10,4 @@ COPY --from=0 /go/src/github.com/kubernetes-csi/external-provisioner/csi-provisi
 RUN useradd csi-provisioner
 USER csi-provisioner
 
-CMD ["/usr/bin/csi-provisioner"]
+ENTRYPOINT ["/usr/bin/csi-provisioner"]
