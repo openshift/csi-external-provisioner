@@ -20,50 +20,47 @@
 #  name = "github.com/x/y"
 #  version = "2.4.0"
 
+# This selects the latest 1.x.y version.
 [[constraint]]
   name = "github.com/container-storage-interface/spec"
-  version = "~0.3.0"
+  version = "1.0"
 
 [[constraint]]
-  name = "github.com/golang/protobuf"
-  version = "v1.1.0"
+  name = "github.com/kubernetes-csi/csi-test"
+  version = "2.0"
 
 [[constraint]]
-  branch = "master"
-  name = "github.com/golang/glog"
+  name = "sigs.k8s.io/sig-storage-lib-external-provisioner"
+  version = "v3.1.0"
 
+# TODO: remove when released
 [[constraint]]
   name = "github.com/kubernetes-csi/external-snapshotter"
-  version = "v0.4.1"
+  branch = "master"
+
+# We need a version which does not use glog, because pulling in glog clashes
+# with klog.Init. Anything >= 1.12 is fine, but we can't specify that
+# because of the lack of semantic versioning in Kubernetes. Therefore we
+# have to pick a certain release, otherwise we (more or less randomly) end
+# up with something older or master.
+[[constraint]]
+  name = "k8s.io/apiserver"
+  version = "kubernetes-1.14.0"
 
 [[constraint]]
-  name = "github.com/kubernetes-incubator/external-storage"
-  version = "v5.2.0"
-
-[[constraint]]
-  name = "google.golang.org/grpc"
-  version = "1.9.2"
-
-[[constraint]]
-  name = "k8s.io/apimachinery"
-  version = "kubernetes-1.12.0"
+  name = "k8s.io/component-base"
+  version = "kubernetes-1.14.0"
 
 [[constraint]]
   name = "k8s.io/client-go"
-  version = "kubernetes-1.12.0"
-
-[[constraint]]
-  name = "k8s.io/api"
-  version = "kubernetes-1.12.0"
-
-[[constraint]]
-  name = "k8s.io/csi-api"
-  version = "kubernetes-1.12.0"
-
-[[constraint]]
-  name = "k8s.io/apiserver"
-  version = "kubernetes-1.12.0"
+  version = "kubernetes-1.14.0"
 
 [[constraint]]
   name = "github.com/kubernetes-csi/csi-lib-utils"
-  version = "0.2.0"
+  version = ">=0.6.1"
+
+[prune]
+  non-go = true
+  go-tests = true
+  unused-packages = true
+
