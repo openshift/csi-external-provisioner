@@ -71,7 +71,7 @@ type VolumeSnapshotSpec struct {
 	// In Alpha version, only PersistentVolumeClaim is supported as the source.
 	// If not specified, user can create VolumeSnapshotContent and bind it with VolumeSnapshot manually.
 	// +optional
-	Source *TypedLocalObjectReference `json:"source" protobuf:"bytes,1,opt,name=source"`
+	Source *core_v1.TypedLocalObjectReference `json:"source" protobuf:"bytes,1,opt,name=source"`
 
 	// SnapshotContentName binds the VolumeSnapshot object with the VolumeSnapshotContent
 	// +optional
@@ -96,27 +96,18 @@ type VolumeSnapshotStatus struct {
 	// +optional
 	RestoreSize *resource.Quantity `json:"restoreSize" protobuf:"bytes,2,opt,name=restoreSize"`
 
-	// Ready is set to true only if the snapshot is ready to use (e.g., finish uploading if
+	// ReadyToUse is set to true only if the snapshot is ready to use (e.g., finish uploading if
 	// there is an uploading phase) and also VolumeSnapshot and its VolumeSnapshotContent
-	// bind correctly with each other. If any of the above condition is not true, Ready is
+	// bind correctly with each other. If any of the above condition is not true, ReadyToUse is
 	// set to false
 	// +optional
-	Ready bool `json:"ready" protobuf:"varint,3,opt,name=ready"`
+	ReadyToUse bool `json:"readyToUse" protobuf:"varint,3,opt,name=readyToUse"`
 
 	// The last error encountered during create snapshot operation, if any.
 	// This field must only be set by the entity completing the create snapshot
 	// operation, i.e. the external-snapshotter.
 	// +optional
 	Error *storage.VolumeError `json:"error,omitempty" protobuf:"bytes,4,opt,name=error,casttype=VolumeError"`
-}
-
-// TypedLocalObjectReference contains enough information to let you locate the typed referenced object inside the same namespace.
-// TODO: After TypedLocalObjectReference is merged into the in-tree core API, this will be replaced.
-type TypedLocalObjectReference struct {
-	// Name of the referent.
-	Name string `json:"name,omitempty" protobuf:"bytes,1,opt,name=name"`
-	// Kind of the referent.
-	Kind string `json:"kind,omitempty" protobuf:"bytes,2,opt,name=kind"`
 }
 
 // +genclient
@@ -141,6 +132,11 @@ type VolumeSnapshotClass struct {
 	// to the snapshotter.
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty" protobuf:"bytes,3,rep,name=parameters"`
+
+	// Optional: what happens to a snapshot content when released from its snapshot.
+	// The default policy is Delete if not specified.
+	// +optional
+	DeletionPolicy *DeletionPolicy `json:"deletionPolicy,omitempty" protobuf:"bytes,4,opt,name=deletionPolicy"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -204,6 +200,11 @@ type VolumeSnapshotContentSpec struct {
 	// be used if it is available.
 	// +optional
 	VolumeSnapshotClassName *string `json:"snapshotClassName" protobuf:"bytes,4,opt,name=snapshotClassName"`
+
+	// Optional: what happens to a snapshot content when released from its snapshot. It will be set to Delete by default
+	// if not specified
+	// +optional
+	DeletionPolicy *DeletionPolicy `json:"deletionPolicy" protobuf:"bytes,5,opt,name=deletionPolicy"`
 }
 
 // VolumeSnapshotSource represents the actual location and type of the snapshot. Only one of its members may be specified.
@@ -213,7 +214,7 @@ type VolumeSnapshotSource struct {
 	CSI *CSIVolumeSnapshotSource `json:"csiVolumeSnapshotSource,omitempty"`
 }
 
-// Represents the source from CSI volume snapshot
+// CSIVolumeSnapshotSource represents the source from CSI volume snapshot
 type CSIVolumeSnapshotSource struct {
 	// Driver is the name of the driver to use for this snapshot.
 	// This MUST be the same name returned by the CSI GetPluginName() call for
@@ -241,3 +242,15 @@ type CSIVolumeSnapshotSource struct {
 	// +optional
 	RestoreSize *int64 `json:"restoreSize,omitempty" protobuf:"bytes,4,opt,name=restoreSize"`
 }
+
+// DeletionPolicy describes a policy for end-of-life maintenance of volume snapshot contents
+type DeletionPolicy string
+
+const (
+	// VolumeSnapshotContentDelete means the snapshot content will be deleted from Kubernetes on release from its volume snapshot.
+	VolumeSnapshotContentDelete DeletionPolicy = "Delete"
+
+	// VolumeSnapshotContentRetain means the snapshot will be left in its current state on release from its volume snapshot.
+	// The default policy is Retain if not specified.
+	VolumeSnapshotContentRetain DeletionPolicy = "Retain"
+)

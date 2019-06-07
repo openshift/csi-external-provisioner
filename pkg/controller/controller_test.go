@@ -18,22 +18,25 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/container-storage-interface/spec/lib/go/csi/v0"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
+	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-test/driver"
 	"github.com/kubernetes-csi/external-provisioner/pkg/features"
 	crdv1 "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1alpha1"
 	"github.com/kubernetes-csi/external-snapshotter/pkg/client/clientset/versioned/fake"
-	"github.com/kubernetes-incubator/external-storage/lib/controller"
 	"google.golang.org/grpc"
-	"k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,19 +47,25 @@ import (
 	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-	fakecsiclientset "k8s.io/csi-api/pkg/client/clientset/versioned/fake"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
 )
 
 const (
-	timeout = 10 * time.Second
+	timeout    = 10 * time.Second
+	driverName = "test-driver"
+)
+
+var (
+	volumeModeFileSystem = v1.PersistentVolumeFilesystem
+	volumeModeBlock      = v1.PersistentVolumeBlock
 )
 
 type csiConnection struct {
 	conn *grpc.ClientConn
 }
 
-func New(address string, timeout time.Duration) (csiConnection, error) {
-	conn, err := Connect(address, timeout)
+func New(address string) (csiConnection, error) {
+	conn, err := connection.Connect(address)
 	if err != nil {
 		return csiConnection{}, err
 	}
@@ -65,7 +74,7 @@ func New(address string, timeout time.Duration) (csiConnection, error) {
 	}, nil
 }
 
-func createMockServer(t *testing.T) (*gomock.Controller,
+func createMockServer(t *testing.T, tmpdir string) (*gomock.Controller,
 	*driver.MockCSIDriver,
 	*driver.MockIdentityServer,
 	*driver.MockControllerServer,
@@ -78,16 +87,24 @@ func createMockServer(t *testing.T) (*gomock.Controller,
 		Identity:   identityServer,
 		Controller: controllerServer,
 	})
-	drv.Start()
+	drv.StartOnAddress("unix", filepath.Join(tmpdir, "csi.sock"))
 
 	// Create a client connection to it
 	addr := drv.Address()
-	csiConn, err := New(addr, timeout)
+	csiConn, err := New(addr)
 	if err != nil {
 		return nil, nil, nil, nil, csiConnection{}, err
 	}
 
 	return mockController, drv, identityServer, controllerServer, csiConn, nil
+}
+
+func tempDir(t *testing.T) string {
+	dir, err := ioutil.TempDir("", "external-attacher-test-")
+	if err != nil {
+		t.Fatalf("Cannot create temporary directory: %s", err)
+	}
+	return dir
 }
 
 func TestGetPluginName(t *testing.T) {
@@ -114,7 +131,9 @@ func TestGetPluginName(t *testing.T) {
 		},
 	}
 
-	mockController, driver, identityServer, _, csiConn, err := createMockServer(t)
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, identityServer, _, csiConn, err := createMockServer(t, tmpdir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,164 +167,102 @@ func TestGetPluginName(t *testing.T) {
 	}
 }
 
-func TestGetDriverCapabilities(t *testing.T) {
-	type testcase struct {
-		name                   string
-		pluginCapabilities     []*csi.PluginCapability_Service_Type
-		controllerCapabilities []*csi.ControllerServiceCapability_RPC_Type
-		injectPluginError      bool
-		injectControllerError  bool
-		expectError            bool
-	}
-	tests := []testcase{{}}
-
-	// Generate test cases by creating all possible combination of capabilities
-	for capName, capValue := range csi.PluginCapability_Service_Type_value {
-		cap := csi.PluginCapability_Service_Type(capValue)
-		var newTests []testcase
-		for _, test := range tests {
-			newTest := testcase{
-				name: fmt.Sprintf("%s,Plugin_%s", test.name, capName),
-			}
-			copy(newTest.pluginCapabilities, append(test.pluginCapabilities, &cap))
-			copy(newTest.controllerCapabilities, test.controllerCapabilities)
-			newTests = append(newTests, newTest)
-		}
-		tests = newTests
-	}
-	for capName, capValue := range csi.ControllerServiceCapability_RPC_Type_value {
-		cap := csi.ControllerServiceCapability_RPC_Type(capValue)
-		var newTests []testcase
-		for _, test := range tests {
-			newTest := testcase{
-				name: fmt.Sprintf("%s,Plugin_%s", test.name, capName),
-			}
-			copy(newTest.pluginCapabilities, test.pluginCapabilities)
-			copy(newTest.controllerCapabilities, append(test.controllerCapabilities, &cap))
-			newTests = append(newTests, newTest)
-		}
-		tests = newTests
-	}
-
-	// nil capabilities tests
-	dummyPluginCap := csi.PluginCapability_Service_CONTROLLER_SERVICE
-	dummyControllerCap := csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME
-	tests = append(tests, []testcase{
+func TestStripPrefixedCSIParams(t *testing.T) {
+	testcases := []struct {
+		name           string
+		params         map[string]string
+		expectedParams map[string]string
+		expectErr      bool
+	}{
 		{
-			name:                   "plugin capabilities with nil entries",
-			pluginCapabilities:     []*csi.PluginCapability_Service_Type{nil},
-			controllerCapabilities: []*csi.ControllerServiceCapability_RPC_Type{&dummyControllerCap},
+			name:           "no prefix",
+			params:         map[string]string{"csiFoo": "bar", "bim": "baz"},
+			expectedParams: map[string]string{"csiFoo": "bar", "bim": "baz"},
 		},
 		{
-			name:                   "controller capabilities with nil entries",
-			pluginCapabilities:     []*csi.PluginCapability_Service_Type{&dummyPluginCap},
-			controllerCapabilities: []*csi.ControllerServiceCapability_RPC_Type{nil},
-		},
-	}...)
-
-	// gRPC errors
-	tests = append(tests, []testcase{
-		{
-			name:                   "plugin capabilities call with gRPC error",
-			pluginCapabilities:     []*csi.PluginCapability_Service_Type{&dummyPluginCap},
-			controllerCapabilities: []*csi.ControllerServiceCapability_RPC_Type{&dummyControllerCap},
-			injectPluginError:      true,
-			expectError:            true,
+			name:           "one prefixed",
+			params:         map[string]string{prefixedControllerPublishSecretNameKey: "bar", "bim": "baz"},
+			expectedParams: map[string]string{"bim": "baz"},
 		},
 		{
-			name:                   "controller capabilities call with gRPC error",
-			pluginCapabilities:     []*csi.PluginCapability_Service_Type{&dummyPluginCap},
-			controllerCapabilities: []*csi.ControllerServiceCapability_RPC_Type{&dummyControllerCap},
-			injectControllerError:  true,
-			expectError:            true,
+			name:           "prefix in value",
+			params:         map[string]string{"foo": prefixedFsTypeKey, "bim": "baz"},
+			expectedParams: map[string]string{"foo": prefixedFsTypeKey, "bim": "baz"},
 		},
-	}...)
+		{
+			name: "all known prefixed",
+			params: map[string]string{
+				prefixedFsTypeKey:                           "csiBar",
+				prefixedProvisionerSecretNameKey:            "csiBar",
+				prefixedProvisionerSecretNamespaceKey:       "csiBar",
+				prefixedControllerPublishSecretNameKey:      "csiBar",
+				prefixedControllerPublishSecretNamespaceKey: "csiBar",
+				prefixedNodeStageSecretNameKey:              "csiBar",
+				prefixedNodeStageSecretNamespaceKey:         "csiBar",
+				prefixedNodePublishSecretNameKey:            "csiBar",
+				prefixedNodePublishSecretNamespaceKey:       "csiBar",
+				prefixedResizerSecretNameKey:                "csiBar",
+				prefixedResizerSecretNamespaceKey:           "csiBar",
+			},
+			expectedParams: map[string]string{},
+		},
+		{
+			name: "all known deprecated params not stripped",
+			params: map[string]string{
+				"fstype":                            "csiBar",
+				provisionerSecretNameKey:            "csiBar",
+				provisionerSecretNamespaceKey:       "csiBar",
+				controllerPublishSecretNameKey:      "csiBar",
+				controllerPublishSecretNamespaceKey: "csiBar",
+				nodeStageSecretNameKey:              "csiBar",
+				nodeStageSecretNamespaceKey:         "csiBar",
+				nodePublishSecretNameKey:            "csiBar",
+				nodePublishSecretNamespaceKey:       "csiBar",
+			},
+			expectedParams: map[string]string{
+				"fstype":                            "csiBar",
+				provisionerSecretNameKey:            "csiBar",
+				provisionerSecretNamespaceKey:       "csiBar",
+				controllerPublishSecretNameKey:      "csiBar",
+				controllerPublishSecretNamespaceKey: "csiBar",
+				nodeStageSecretNameKey:              "csiBar",
+				nodeStageSecretNamespaceKey:         "csiBar",
+				nodePublishSecretNameKey:            "csiBar",
+				nodePublishSecretNamespaceKey:       "csiBar",
+			},
+		},
 
-	mockController, driver, identityServer, controllerServer, csiConn, err := createMockServer(t)
-	if err != nil {
-		t.Fatal(err)
+		{
+			name:      "unknown prefixed var",
+			params:    map[string]string{csiParameterPrefix + "bim": "baz"},
+			expectErr: true,
+		},
+		{
+			name:           "empty",
+			params:         map[string]string{},
+			expectedParams: map[string]string{},
+		},
 	}
-	defer mockController.Finish()
-	defer driver.Stop()
-	for _, test := range tests {
 
-		var injectedPluginErr, injectedControllerErr error
-		if test.injectPluginError {
-			injectedPluginErr = fmt.Errorf("mock error")
-		}
-		if test.injectControllerError {
-			injectedControllerErr = fmt.Errorf("mock error")
-		}
+	for _, tc := range testcases {
+		t.Logf("test: %v", tc.name)
 
-		var pluginCaps []*csi.PluginCapability
-		for _, cap := range test.pluginCapabilities {
-			var c *csi.PluginCapability
-			if cap == nil {
-				c = &csi.PluginCapability{Type: nil}
+		newParams, err := removePrefixedParameters(tc.params)
+		if err != nil {
+			if tc.expectErr {
+				continue
 			} else {
-				c = &csi.PluginCapability{
-					Type: &csi.PluginCapability_Service_{
-						Service: &csi.PluginCapability_Service{
-							Type: *cap,
-						},
-					},
-				}
+				t.Fatalf("Encountered unexpected error: %v", err)
 			}
-			pluginCaps = append(pluginCaps, c)
+		} else {
+			if tc.expectErr {
+				t.Fatalf("Did not get error when one was expected")
+			}
 		}
-		pluginResponse := &csi.GetPluginCapabilitiesResponse{Capabilities: pluginCaps}
 
-		var controllerCaps []*csi.ControllerServiceCapability
-		for _, cap := range test.controllerCapabilities {
-			var c *csi.ControllerServiceCapability
-			if cap == nil {
-				c = &csi.ControllerServiceCapability{Type: nil}
-			} else {
-				c = &csi.ControllerServiceCapability{
-					Type: &csi.ControllerServiceCapability_Rpc{
-						Rpc: &csi.ControllerServiceCapability_RPC{
-							Type: *cap,
-						},
-					},
-				}
-			}
-			controllerCaps = append(controllerCaps, c)
-		}
-		controllerResponse := &csi.ControllerGetCapabilitiesResponse{Capabilities: controllerCaps}
-
-		identityServer.EXPECT().GetPluginCapabilities(gomock.Any(), &csi.GetPluginCapabilitiesRequest{}).Return(pluginResponse, injectedPluginErr).Times(1)
-		controllerServer.EXPECT().ControllerGetCapabilities(gomock.Any(), &csi.ControllerGetCapabilitiesRequest{}).Return(controllerResponse, injectedControllerErr).MinTimes(0).MaxTimes(1)
-
-		capabilities, err := getDriverCapabilities(csiConn.conn, timeout)
-		if err != nil && !test.expectError {
-			t.Errorf("test %q failed with error: %v\n", test.name, err)
-		}
-		if err == nil {
-			ok := true
-			for _, cap := range test.pluginCapabilities {
-				if cap != nil {
-					switch *cap {
-					case csi.PluginCapability_Service_CONTROLLER_SERVICE:
-						ok = ok && capabilities.Has(PluginCapability_CONTROLLER_SERVICE)
-					case csi.PluginCapability_Service_ACCESSIBILITY_CONSTRAINTS:
-						ok = ok && capabilities.Has(PluginCapability_ACCESSIBILITY_CONSTRAINTS)
-					}
-				}
-			}
-			for _, cap := range test.controllerCapabilities {
-				if cap != nil {
-					switch *cap {
-					case csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME:
-						ok = ok && capabilities.Has(ControllerCapability_CREATE_DELETE_VOLUME)
-					case csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT:
-						ok = ok && capabilities.Has(ControllerCapability_CREATE_DELETE_SNAPSHOT)
-					}
-				}
-			}
-
-			if !ok {
-				t.Errorf("test %q: missing capabilities", test.name)
-			}
+		eq := reflect.DeepEqual(newParams, tc.expectedParams)
+		if !eq {
+			t.Fatalf("Stripped parameters: %v not equal to expected parameters: %v", newParams, tc.expectedParams)
 		}
 	}
 }
@@ -343,7 +300,9 @@ func TestGetDriverName(t *testing.T) {
 		},
 	}
 
-	mockController, driver, identityServer, _, csiConn, err := createMockServer(t)
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, identityServer, _, csiConn, err := createMockServer(t, tmpdir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,33 +381,36 @@ func TestBytesToQuantity(t *testing.T) {
 func TestCreateDriverReturnsInvalidCapacityDuringProvision(t *testing.T) {
 	// Set up mocks
 	var requestedBytes int64 = 100
-	mockController, driver, identityServer, controllerServer, csiConn, err := createMockServer(t)
+
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mockController.Finish()
 	defer driver.Stop()
 
-	csiProvisioner := NewCSIProvisioner(nil, nil, driver.Address(), 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil)
+	pluginCaps, controllerCaps := provisionCapabilities()
+	csiProvisioner := NewCSIProvisioner(nil, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
 
 	// Requested PVC with requestedBytes storage
 	opts := controller.VolumeOptions{
 		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-		PVName:     "test-name",
-		PVC:        createFakePVC(requestedBytes),
-		Parameters: map[string]string{},
+		PVName:                        "test-name",
+		PVC:                           createFakePVC(requestedBytes),
+		Parameters:                    map[string]string{},
 	}
 
 	// Drivers CreateVolume response with lower capacity bytes than request
 	out := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			CapacityBytes: requestedBytes - 1,
-			Id:            "test-volume-id",
+			VolumeId:      "test-volume-id",
 		},
 	}
 
 	// Set up Mocks
-	provisionMockServerSetupExpectations(identityServer, controllerServer)
 	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 	// Since capacity returned by driver is invalid, we expect the provision call to clean up the volume
 	controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
@@ -464,107 +426,30 @@ func TestCreateDriverReturnsInvalidCapacityDuringProvision(t *testing.T) {
 	t.Logf("Provision encountered an error: %v, expected: create volume capacity less than requested capacity", err)
 }
 
-func provisionMockServerSetupExpectations(identityServer *driver.MockIdentityServer, controllerServer *driver.MockControllerServer) {
-	identityServer.EXPECT().GetPluginCapabilities(gomock.Any(), gomock.Any()).Return(&csi.GetPluginCapabilitiesResponse{
-		Capabilities: []*csi.PluginCapability{
-			&csi.PluginCapability{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	controllerServer.EXPECT().ControllerGetCapabilities(gomock.Any(), gomock.Any()).Return(&csi.ControllerGetCapabilitiesResponse{
-		Capabilities: []*csi.ControllerServiceCapability{
-			&csi.ControllerServiceCapability{
-				Type: &csi.ControllerServiceCapability_Rpc{
-					Rpc: &csi.ControllerServiceCapability_RPC{
-						Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	identityServer.EXPECT().GetPluginInfo(gomock.Any(), gomock.Any()).Return(&csi.GetPluginInfoResponse{
-		Name:          "test-driver",
-		VendorVersion: "test-vendor",
-	}, nil).Times(1)
+func provisionCapabilities() (connection.PluginCapabilitySet, connection.ControllerCapabilitySet) {
+	return connection.PluginCapabilitySet{
+			csi.PluginCapability_Service_CONTROLLER_SERVICE: true,
+		}, connection.ControllerCapabilitySet{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME: true,
+		}
 }
 
-// provisionFromSnapshotMockServerSetupExpectations mocks plugin and controller capabilities reported
-// by a CSI plugin that supports the snapshot feature
-func provisionFromSnapshotMockServerSetupExpectations(identityServer *driver.MockIdentityServer, controllerServer *driver.MockControllerServer) {
-	identityServer.EXPECT().GetPluginCapabilities(gomock.Any(), gomock.Any()).Return(&csi.GetPluginCapabilitiesResponse{
-		Capabilities: []*csi.PluginCapability{
-			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	controllerServer.EXPECT().ControllerGetCapabilities(gomock.Any(), gomock.Any()).Return(&csi.ControllerGetCapabilitiesResponse{
-		Capabilities: []*csi.ControllerServiceCapability{
-			{
-				Type: &csi.ControllerServiceCapability_Rpc{
-					Rpc: &csi.ControllerServiceCapability_RPC{
-						Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					},
-				},
-			},
-			{
-				Type: &csi.ControllerServiceCapability_Rpc{
-					Rpc: &csi.ControllerServiceCapability_RPC{
-						Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	identityServer.EXPECT().GetPluginInfo(gomock.Any(), gomock.Any()).Return(&csi.GetPluginInfoResponse{
-		Name:          "test-driver",
-		VendorVersion: "test-vendor",
-	}, nil).Times(1)
+func provisionFromSnapshotCapabilities() (connection.PluginCapabilitySet, connection.ControllerCapabilitySet) {
+	return connection.PluginCapabilitySet{
+			csi.PluginCapability_Service_CONTROLLER_SERVICE: true,
+		}, connection.ControllerCapabilitySet{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME:   true,
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT: true,
+		}
 }
 
-func provisionWithTopologyMockServerSetupExpectations(identityServer *driver.MockIdentityServer, controllerServer *driver.MockControllerServer) {
-	identityServer.EXPECT().GetPluginCapabilities(gomock.Any(), gomock.Any()).Return(&csi.GetPluginCapabilitiesResponse{
-		Capabilities: []*csi.PluginCapability{
-			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
-					},
-				},
-			},
-			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_ACCESSIBILITY_CONSTRAINTS,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	controllerServer.EXPECT().ControllerGetCapabilities(gomock.Any(), gomock.Any()).Return(&csi.ControllerGetCapabilitiesResponse{
-		Capabilities: []*csi.ControllerServiceCapability{
-			{
-				Type: &csi.ControllerServiceCapability_Rpc{
-					Rpc: &csi.ControllerServiceCapability_RPC{
-						Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					},
-				},
-			},
-		},
-	}, nil).Times(1)
-	identityServer.EXPECT().GetPluginInfo(gomock.Any(), gomock.Any()).Return(&csi.GetPluginInfoResponse{
-		Name:          "test-driver",
-		VendorVersion: "test-vendor",
-	}, nil).Times(1)
+func provisionWithTopologyCapabilities() (connection.PluginCapabilitySet, connection.ControllerCapabilitySet) {
+	return connection.PluginCapabilitySet{
+			csi.PluginCapability_Service_CONTROLLER_SERVICE:               true,
+			csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS: true,
+		}, connection.ControllerCapabilitySet{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME: true,
+		}
 }
 
 // Minimal PVC required for tests to function
@@ -584,77 +469,108 @@ func createFakePVC(requestBytes int64) *v1.PersistentVolumeClaim {
 	}
 }
 
+// createFakePVCWithVolumeMode returns PVC with VolumeMode
+func createFakePVCWithVolumeMode(requestBytes int64, volumeMode v1.PersistentVolumeMode) *v1.PersistentVolumeClaim {
+	claim := createFakePVC(requestBytes)
+	claim.Spec.VolumeMode = &volumeMode
+	return claim
+}
+
 func TestGetSecretReference(t *testing.T) {
 	testcases := map[string]struct {
-		nameKey      string
-		namespaceKey string
+		secretParams deprecatedSecretParamsMap
 		params       map[string]string
 		pvName       string
 		pvc          *v1.PersistentVolumeClaim
 
 		expectRef *v1.SecretReference
-		expectErr error
+		expectErr bool
 	}{
 		"no params": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params:       nil,
 			expectRef:    nil,
-			expectErr:    nil,
 		},
 		"empty err": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params:       map[string]string{nodePublishSecretNameKey: "", nodePublishSecretNamespaceKey: ""},
-			expectErr:    fmt.Errorf("csiNodePublishSecretName and csiNodePublishSecretNamespace parameters must be specified together"),
+			expectErr:    true,
+		},
+		"[deprecated] name, no namespace": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNameKey: "foo"},
+			expectErr:    true,
 		},
 		"name, no namespace": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
-			params:       map[string]string{nodePublishSecretNameKey: "foo"},
-			expectErr:    fmt.Errorf("csiNodePublishSecretName and csiNodePublishSecretNamespace parameters must be specified together"),
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{prefixedNodePublishSecretNameKey: "foo"},
+			expectErr:    true,
+		},
+		"[deprecated] namespace, no name": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNamespaceKey: "foo"},
+			expectErr:    true,
 		},
 		"namespace, no name": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
-			params:       map[string]string{nodePublishSecretNamespaceKey: "foo"},
-			expectErr:    fmt.Errorf("csiNodePublishSecretName and csiNodePublishSecretNamespace parameters must be specified together"),
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{prefixedNodePublishSecretNamespaceKey: "foo"},
+			expectErr:    true,
 		},
-		"simple - valid": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+		"[deprecated] simple - valid": {
+			secretParams: nodePublishSecretParams,
 			params:       map[string]string{nodePublishSecretNameKey: "name", nodePublishSecretNamespaceKey: "ns"},
 			pvc:          &v1.PersistentVolumeClaim{},
 			expectRef:    &v1.SecretReference{Name: "name", Namespace: "ns"},
-			expectErr:    nil,
+		},
+		"deprecated and new both": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNameKey: "name", nodePublishSecretNamespaceKey: "ns", prefixedNodePublishSecretNameKey: "name", prefixedNodePublishSecretNamespaceKey: "ns"},
+			expectErr:    true,
+		},
+		"deprecated and new names": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNameKey: "name", nodePublishSecretNamespaceKey: "ns", prefixedNodePublishSecretNameKey: "name"},
+			expectErr:    true,
+		},
+		"deprecated and new namespace": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNameKey: "name", nodePublishSecretNamespaceKey: "ns", prefixedNodePublishSecretNamespaceKey: "ns"},
+			expectErr:    true,
+		},
+		"deprecated and new mixed": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{nodePublishSecretNameKey: "name", prefixedNodePublishSecretNamespaceKey: "ns"},
+			pvc:          &v1.PersistentVolumeClaim{},
+			expectRef:    &v1.SecretReference{Name: "name", Namespace: "ns"},
+		},
+		"simple - valid": {
+			secretParams: nodePublishSecretParams,
+			params:       map[string]string{prefixedNodePublishSecretNameKey: "name", prefixedNodePublishSecretNamespaceKey: "ns"},
+			pvc:          &v1.PersistentVolumeClaim{},
+			expectRef:    &v1.SecretReference{Name: "name", Namespace: "ns"},
 		},
 		"simple - valid, no pvc": {
-			nameKey:      provisionerSecretNameKey,
-			namespaceKey: provisionerSecretNamespaceKey,
+			secretParams: provisionerSecretParams,
 			params:       map[string]string{provisionerSecretNameKey: "name", provisionerSecretNamespaceKey: "ns"},
 			pvc:          nil,
 			expectRef:    &v1.SecretReference{Name: "name", Namespace: "ns"},
-			expectErr:    nil,
 		},
 		"simple - invalid name": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params:       map[string]string{nodePublishSecretNameKey: "bad name", nodePublishSecretNamespaceKey: "ns"},
 			pvc:          &v1.PersistentVolumeClaim{},
 			expectRef:    nil,
-			expectErr:    fmt.Errorf(`csiNodePublishSecretName parameter "bad name" is not a valid secret name`),
+			expectErr:    true,
 		},
 		"simple - invalid namespace": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params:       map[string]string{nodePublishSecretNameKey: "name", nodePublishSecretNamespaceKey: "bad ns"},
 			pvc:          &v1.PersistentVolumeClaim{},
 			expectRef:    nil,
-			expectErr:    fmt.Errorf(`csiNodePublishSecretNamespace parameter "bad ns" is not a valid namespace name`),
+			expectErr:    true,
 		},
 		"template - valid": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params: map[string]string{
 				nodePublishSecretNameKey:      "static-${pv.name}-${pvc.namespace}-${pvc.name}-${pvc.annotations['akey']}",
 				nodePublishSecretNamespaceKey: "static-${pv.name}-${pvc.namespace}",
@@ -668,37 +584,41 @@ func TestGetSecretReference(t *testing.T) {
 				},
 			},
 			expectRef: &v1.SecretReference{Name: "static-pvname-pvcnamespace-pvcname-avalue", Namespace: "static-pvname-pvcnamespace"},
-			expectErr: nil,
 		},
 		"template - invalid namespace tokens": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params: map[string]string{
 				nodePublishSecretNameKey:      "myname",
 				nodePublishSecretNamespaceKey: "mynamespace${bar}",
 			},
 			pvc:       &v1.PersistentVolumeClaim{},
 			expectRef: nil,
-			expectErr: fmt.Errorf(`error resolving csiNodePublishSecretNamespace value "mynamespace${bar}": invalid tokens: ["bar"]`),
+			expectErr: true,
 		},
 		"template - invalid name tokens": {
-			nameKey:      nodePublishSecretNameKey,
-			namespaceKey: nodePublishSecretNamespaceKey,
+			secretParams: nodePublishSecretParams,
 			params: map[string]string{
 				nodePublishSecretNameKey:      "myname${foo}",
 				nodePublishSecretNamespaceKey: "mynamespace",
 			},
 			pvc:       &v1.PersistentVolumeClaim{},
 			expectRef: nil,
-			expectErr: fmt.Errorf(`error resolving csiNodePublishSecretName value "myname${foo}": invalid tokens: ["foo"]`),
+			expectErr: true,
 		},
 	}
 
 	for k, tc := range testcases {
 		t.Run(k, func(t *testing.T) {
-			ref, err := getSecretReference(tc.nameKey, tc.namespaceKey, tc.params, tc.pvName, tc.pvc)
-			if !reflect.DeepEqual(err, tc.expectErr) {
-				t.Errorf("Expected %v, got %v", tc.expectErr, err)
+			ref, err := getSecretReference(tc.secretParams, tc.params, tc.pvName, tc.pvc)
+			if err != nil {
+				if tc.expectErr {
+					return
+				}
+				t.Fatalf("Did not expect error but got: %v", err)
+			} else {
+				if tc.expectErr {
+					t.Fatalf("Expected error but got none")
+				}
 			}
 			if !reflect.DeepEqual(ref, tc.expectRef) {
 				t.Errorf("Expected %v, got %v", tc.expectRef, ref)
@@ -707,35 +627,36 @@ func TestGetSecretReference(t *testing.T) {
 	}
 }
 
+type provisioningTestcase struct {
+	volOpts           controller.VolumeOptions
+	notNilSelector    bool
+	makeVolumeNameErr bool
+	getSecretRefErr   bool
+	getCredentialsErr bool
+	volWithLessCap    bool
+	expectedPVSpec    *pvSpec
+	withSecretRefs    bool
+	expectErr         bool
+	expectCreateVolDo interface{}
+}
+
+type pvSpec struct {
+	Name          string
+	ReclaimPolicy v1.PersistentVolumeReclaimPolicy
+	AccessModes   []v1.PersistentVolumeAccessMode
+	VolumeMode    *v1.PersistentVolumeMode
+	Capacity      v1.ResourceList
+	CSIPVS        *v1.CSIPersistentVolumeSource
+}
+
 func TestProvision(t *testing.T) {
 	var requestedBytes int64 = 100
-
-	type pvSpec struct {
-		Name          string
-		ReclaimPolicy v1.PersistentVolumeReclaimPolicy
-		AccessModes   []v1.PersistentVolumeAccessMode
-		Capacity      v1.ResourceList
-		CSIPVS        *v1.CSIPersistentVolumeSource
-	}
-
-	testcases := map[string]struct {
-		volOpts           controller.VolumeOptions
-		notNilSelector    bool
-		driverNotReady    bool
-		makeVolumeNameErr bool
-		getSecretRefErr   bool
-		getCredentialsErr bool
-		volWithLessCap    bool
-		expectedPVSpec    *pvSpec
-		withSecretRefs    bool
-		expectErr         bool
-		expectCreateVolDo interface{}
-	}{
+	testcases := map[string]provisioningTestcase{
 		"normal provision": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
-				PVC:    createFakePVC(requestedBytes),
+				PVName:                        "test-name",
+				PVC:                           createFakePVC(requestedBytes),
 				Parameters: map[string]string{
 					"fstype": "ext3",
 				},
@@ -756,10 +677,52 @@ func TestProvision(t *testing.T) {
 				},
 			},
 		},
+		"multiple fsType provision": {
+			volOpts: controller.VolumeOptions{
+				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				PVName:                        "test-name",
+				PVC:                           createFakePVC(requestedBytes),
+				Parameters: map[string]string{
+					"fstype":          "ext3",
+					prefixedFsTypeKey: "ext4",
+				},
+			},
+			expectErr: true,
+		},
+		"provision with prefixed FS Type key": {
+			volOpts: controller.VolumeOptions{
+				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				PVName:                        "test-name",
+				PVC:                           createFakePVC(requestedBytes),
+				Parameters: map[string]string{
+					prefixedFsTypeKey: "ext3",
+				},
+			},
+			expectedPVSpec: &pvSpec{
+				Name:          "test-testi",
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext3",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+			expectCreateVolDo: func(ctx context.Context, req *csi.CreateVolumeRequest) {
+				if len(req.Parameters) != 0 {
+					t.Errorf("Parameters should have been stripped")
+				}
+			},
+		},
 		"provision with access mode multi node multi writer": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
+				PVName:                        "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID: "testid",
@@ -807,7 +770,7 @@ func TestProvision(t *testing.T) {
 		"provision with access mode multi node multi readonly": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
+				PVName:                        "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID: "testid",
@@ -855,7 +818,7 @@ func TestProvision(t *testing.T) {
 		"provision with access mode single writer": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
+				PVName:                        "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID: "testid",
@@ -903,7 +866,7 @@ func TestProvision(t *testing.T) {
 		"provision with multiple access modes": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
+				PVName:                        "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID: "testid",
@@ -988,6 +951,49 @@ func TestProvision(t *testing.T) {
 				},
 			},
 		},
+		"provision with volume mode(Filesystem)": {
+			volOpts: controller.VolumeOptions{
+				PVName:     "test-name",
+				PVC:        createFakePVCWithVolumeMode(requestedBytes, volumeModeFileSystem),
+				Parameters: map[string]string{},
+			},
+			expectedPVSpec: &pvSpec{
+				Name: "test-testi",
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				VolumeMode: &volumeModeFileSystem,
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext4",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+		},
+		"provision with volume mode(Block)": {
+			volOpts: controller.VolumeOptions{
+				PVName:     "test-name",
+				PVC:        createFakePVCWithVolumeMode(requestedBytes, volumeModeBlock),
+				Parameters: map[string]string{},
+			},
+			expectedPVSpec: &pvSpec{
+				Name: "test-testi",
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				VolumeMode: &volumeModeBlock,
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+		},
 		"fail to get secret reference": {
 			volOpts: controller.VolumeOptions{
 				PVName:     "test-name",
@@ -1003,14 +1009,6 @@ func TestProvision(t *testing.T) {
 				PVC:    createFakePVC(requestedBytes),
 			},
 			notNilSelector: true,
-			expectErr:      true,
-		},
-		"fail driver not ready": {
-			volOpts: controller.VolumeOptions{
-				PVName: "test-name",
-				PVC:    createFakePVC(requestedBytes),
-			},
-			driverNotReady: true,
 			expectErr:      true,
 		},
 		"fail to make volume name": {
@@ -1039,117 +1037,66 @@ func TestProvision(t *testing.T) {
 			volWithLessCap: true,
 			expectErr:      true,
 		},
+		"provision with mount options": {
+			volOpts: controller.VolumeOptions{
+				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				PVName:                        "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "testid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+					},
+				},
+				MountOptions: []string{"foo=bar", "baz=qux"},
+				Parameters:   map[string]string{},
+			},
+			expectedPVSpec: &pvSpec{
+				Name:          "test-testi",
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				AccessModes:   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext4",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+			expectCreateVolDo: func(ctx context.Context, req *csi.CreateVolumeRequest) {
+				if len(req.GetVolumeCapabilities()) != 1 {
+					t.Errorf("Incorrect length in volume capabilities")
+				}
+				cap := req.GetVolumeCapabilities()[0]
+				if cap.GetAccessMode() == nil {
+					t.Errorf("Expected access mode to be set")
+				}
+				if cap.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
+					t.Errorf("Expected multi reade only")
+				}
+				if cap.GetMount() == nil {
+					t.Errorf("Expected access type to be mount")
+				}
+				if !reflect.DeepEqual(cap.GetMount().MountFlags, []string{"foo=bar", "baz=qux"}) {
+					t.Errorf("Expected 2 mount options")
+				}
+			},
+		},
 	}
-
-	mockController, driver, identityServer, controllerServer, csiConn, err := createMockServer(t)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mockController.Finish()
-	defer driver.Stop()
 
 	for k, tc := range testcases {
-		var clientSet kubernetes.Interface
-
-		if tc.withSecretRefs {
-			clientSet = fakeclientset.NewSimpleClientset(&v1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "ctrlpublishsecret",
-					Namespace: "default",
-				},
-			}, &v1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "nodestagesecret",
-					Namespace: "default",
-				},
-			}, &v1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "nodepublishsecret",
-					Namespace: "default",
-				},
-			})
-		} else {
-			clientSet = fakeclientset.NewSimpleClientset()
-		}
-
-		csiProvisioner := NewCSIProvisioner(clientSet, nil, driver.Address(), 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil)
-
-		out := &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				CapacityBytes: requestedBytes,
-				Id:            "test-volume-id",
-			},
-		}
-
-		if tc.withSecretRefs {
-			tc.volOpts.Parameters[controllerPublishSecretNameKey] = "ctrlpublishsecret"
-			tc.volOpts.Parameters[controllerPublishSecretNamespaceKey] = "default"
-			tc.volOpts.Parameters[nodeStageSecretNameKey] = "nodestagesecret"
-			tc.volOpts.Parameters[nodeStageSecretNamespaceKey] = "default"
-			tc.volOpts.Parameters[nodePublishSecretNameKey] = "nodepublishsecret"
-			tc.volOpts.Parameters[nodePublishSecretNamespaceKey] = "default"
-		}
-
-		if tc.notNilSelector {
-			tc.volOpts.PVC.Spec.Selector = &metav1.LabelSelector{}
-		} else if tc.driverNotReady {
-			identityServer.EXPECT().GetPluginCapabilities(gomock.Any(), gomock.Any()).Return(nil, errors.New("driver not ready")).Times(1)
-		} else if tc.makeVolumeNameErr {
-			tc.volOpts.PVC.ObjectMeta.UID = ""
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-		} else if tc.getSecretRefErr {
-			tc.volOpts.Parameters[provisionerSecretNameKey] = ""
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-		} else if tc.getCredentialsErr {
-			tc.volOpts.Parameters[provisionerSecretNameKey] = "secretx"
-			tc.volOpts.Parameters[provisionerSecretNamespaceKey] = "default"
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-		} else if tc.volWithLessCap {
-			out.Volume.CapacityBytes = int64(80)
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
-			controllerServer.EXPECT().DeleteVolume(gomock.Any(), gomock.Any()).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
-		} else if tc.expectCreateVolDo != nil {
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Do(tc.expectCreateVolDo).Return(out, nil).Times(1)
-		} else {
-			// Setup regular mock call expectations.
-			provisionMockServerSetupExpectations(identityServer, controllerServer)
-			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
-		}
-
-		pv, err := csiProvisioner.Provision(tc.volOpts)
-		if tc.expectErr && err == nil {
-			t.Errorf("test %q: Expected error, got none", k)
-		}
-		if !tc.expectErr && err != nil {
-			t.Errorf("test %q: got error: %v", k, err)
-		}
-
-		if tc.expectedPVSpec != nil {
-			if pv.Name != tc.expectedPVSpec.Name {
-				t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
-			}
-
-			if pv.Spec.PersistentVolumeReclaimPolicy != tc.expectedPVSpec.ReclaimPolicy {
-				t.Errorf("test %q: expected reclaim policy: %v, got: %v", k, tc.expectedPVSpec.ReclaimPolicy, pv.Spec.PersistentVolumeReclaimPolicy)
-			}
-
-			if !reflect.DeepEqual(pv.Spec.AccessModes, tc.expectedPVSpec.AccessModes) {
-				t.Errorf("test %q: expected access modes: %v, got: %v", k, tc.expectedPVSpec.AccessModes, pv.Spec.AccessModes)
-			}
-
-			if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
-				t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
-			}
-
-			if tc.expectedPVSpec.CSIPVS != nil {
-				if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
-					t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
-				}
-			}
-
-		}
+		runProvisionTest(t, k, tc, requestedBytes)
 	}
 }
 
@@ -1164,7 +1111,7 @@ func newSnapshot(name, className, boundToContent, snapshotUID, claimName string,
 			SelfLink:        "/apis/snapshot.storage.k8s.io/v1alpha1/namespaces/" + "default" + "/volumesnapshots/" + name,
 		},
 		Spec: crdv1.VolumeSnapshotSpec{
-			Source: &crdv1.TypedLocalObjectReference{
+			Source: &corev1.TypedLocalObjectReference{
 				Name: claimName,
 				Kind: "PersistentVolumeClaim",
 			},
@@ -1173,13 +1120,127 @@ func newSnapshot(name, className, boundToContent, snapshotUID, claimName string,
 		},
 		Status: crdv1.VolumeSnapshotStatus{
 			CreationTime: creationTime,
-			Ready:        ready,
+			ReadyToUse:   ready,
 			Error:        err,
 			RestoreSize:  size,
 		},
 	}
 
 	return &snapshot
+}
+
+func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requestedBytes int64) {
+	t.Logf("Running test: %v", k)
+
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockController.Finish()
+	defer driver.Stop()
+
+	var clientSet kubernetes.Interface
+
+	if tc.withSecretRefs {
+		clientSet = fakeclientset.NewSimpleClientset(&v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ctrlpublishsecret",
+				Namespace: "default",
+			},
+		}, &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nodestagesecret",
+				Namespace: "default",
+			},
+		}, &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nodepublishsecret",
+				Namespace: "default",
+			},
+		})
+	} else {
+		clientSet = fakeclientset.NewSimpleClientset()
+	}
+
+	pluginCaps, controllerCaps := provisionCapabilities()
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+
+	out := &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			CapacityBytes: requestedBytes,
+			VolumeId:      "test-volume-id",
+		},
+	}
+
+	if tc.withSecretRefs {
+		tc.volOpts.Parameters[controllerPublishSecretNameKey] = "ctrlpublishsecret"
+		tc.volOpts.Parameters[controllerPublishSecretNamespaceKey] = "default"
+		tc.volOpts.Parameters[nodeStageSecretNameKey] = "nodestagesecret"
+		tc.volOpts.Parameters[nodeStageSecretNamespaceKey] = "default"
+		tc.volOpts.Parameters[nodePublishSecretNameKey] = "nodepublishsecret"
+		tc.volOpts.Parameters[nodePublishSecretNamespaceKey] = "default"
+	}
+
+	if tc.notNilSelector {
+		tc.volOpts.PVC.Spec.Selector = &metav1.LabelSelector{}
+	} else if tc.makeVolumeNameErr {
+		tc.volOpts.PVC.ObjectMeta.UID = ""
+	} else if tc.getSecretRefErr {
+		tc.volOpts.Parameters[provisionerSecretNameKey] = ""
+	} else if tc.getCredentialsErr {
+		tc.volOpts.Parameters[provisionerSecretNameKey] = "secretx"
+		tc.volOpts.Parameters[provisionerSecretNamespaceKey] = "default"
+	} else if tc.volWithLessCap {
+		out.Volume.CapacityBytes = int64(80)
+		controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		controllerServer.EXPECT().DeleteVolume(gomock.Any(), gomock.Any()).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+	} else if tc.expectCreateVolDo != nil {
+		controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Do(tc.expectCreateVolDo).Return(out, nil).Times(1)
+	} else {
+		// Setup regular mock call expectations.
+		if !tc.expectErr {
+			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		}
+	}
+
+	pv, err := csiProvisioner.Provision(tc.volOpts)
+	if tc.expectErr && err == nil {
+		t.Errorf("test %q: Expected error, got none", k)
+	}
+	if !tc.expectErr && err != nil {
+		t.Errorf("test %q: got error: %v", k, err)
+	}
+
+	if tc.expectedPVSpec != nil {
+		if pv.Name != tc.expectedPVSpec.Name {
+			t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
+		}
+
+		if pv.Spec.PersistentVolumeReclaimPolicy != tc.expectedPVSpec.ReclaimPolicy {
+			t.Errorf("test %q: expected reclaim policy: %v, got: %v", k, tc.expectedPVSpec.ReclaimPolicy, pv.Spec.PersistentVolumeReclaimPolicy)
+		}
+
+		if !reflect.DeepEqual(pv.Spec.AccessModes, tc.expectedPVSpec.AccessModes) {
+			t.Errorf("test %q: expected access modes: %v, got: %v", k, tc.expectedPVSpec.AccessModes, pv.Spec.AccessModes)
+		}
+
+		if !reflect.DeepEqual(pv.Spec.VolumeMode, tc.expectedPVSpec.VolumeMode) {
+			t.Errorf("test %q: expected volumeMode: %v, got: %v", k, tc.expectedPVSpec.VolumeMode, pv.Spec.VolumeMode)
+		}
+
+		if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
+			t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
+		}
+
+		if tc.expectedPVSpec.CSIPVS != nil {
+			if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
+				t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
+			}
+		}
+
+	}
 }
 
 // newContent returns a new content with given attributes
@@ -1222,11 +1283,11 @@ func newContent(name, className, snapshotHandle, volumeUID, volumeName, boundToS
 
 // TestProvisionFromSnapshot tests create volume from snapshot
 func TestProvisionFromSnapshot(t *testing.T) {
-	var apiGrp string = "snapshot.storage.k8s.io"
-	var unsupportedAPIGrp string = "unsupported.group.io"
+	var apiGrp = "snapshot.storage.k8s.io"
+	var unsupportedAPIGrp = "unsupported.group.io"
 	var requestedBytes int64 = 1000
-	var snapName string = "test-snapshot"
-	var snapClassName string = "test-snapclass"
+	var snapName = "test-snapshot"
+	var snapClassName = "test-snapclass"
 	var timeNow = time.Now().UnixNano()
 	var metaTimeNowUnix = &metav1.Time{
 		Time: time.Unix(0, timeNow),
@@ -1251,7 +1312,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		"provision with volume snapshot data source": {
 			volOpts: controller.VolumeOptions{
 				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName: "test-name",
+				PVName:                        "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID: "testid",
@@ -1429,7 +1490,9 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		},
 	}
 
-	mockController, driver, identityServer, controllerServer, csiConn, err := createMockServer(t)
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1451,22 +1514,17 @@ func TestProvisionFromSnapshot(t *testing.T) {
 			return true, content, nil
 		})
 
-		csiProvisioner := NewCSIProvisioner(clientSet, nil, driver.Address(), 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, client)
+		pluginCaps, controllerCaps := provisionFromSnapshotCapabilities()
+		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, client, driverName, pluginCaps, controllerCaps, "")
 
 		out := &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				CapacityBytes: requestedBytes,
-				Id:            "test-volume-id",
+				VolumeId:      "test-volume-id",
 			},
 		}
 
-		// Setup mock call expectations. If tc.wrongDataSource is false, DataSource is valid
-		// and the controller will proceed to check whether the plugin supports snapshot.
-		// So in this case, we need the plugin to report snapshot support capabilities;
-		// Otherwise, the controller will fail the operation so it won't check the capabilities.
-		if tc.wrongDataSource == false {
-			provisionFromSnapshotMockServerSetupExpectations(identityServer, controllerServer)
-		}
+		// Setup mock call expectations.
 		// If tc.restoredVolSizeSmall is true, or tc.wrongDataSource is true, or
 		// tc.snapshotStatusReady is false,  create volume from snapshot operation will fail
 		// early and therefore CreateVolume is not expected to be called.
@@ -1504,8 +1562,62 @@ func TestProvisionFromSnapshot(t *testing.T) {
 }
 
 // TestProvisionWithTopology is a basic test of provisioner integration with topology functions.
-func TestProvisionWithTopology(t *testing.T) {
+func TestProvisionWithTopologyEnabled(t *testing.T) {
 	defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, true)()
+
+	const requestBytes = 100
+
+	testcases := map[string]struct {
+		driverSupportsTopology bool
+		nodeLabels             []map[string]string
+		topologyKeys           []map[string][]string
+		expectedNodeAffinity   *v1.VolumeNodeAffinity
+		expectError            bool
+	}{
+		"topology success": {
+			driverSupportsTopology: true,
+			nodeLabels: []map[string]string{
+				{"com.example.csi/zone": "zone1", "com.example.csi/rack": "rack1"},
+				{"com.example.csi/zone": "zone1", "com.example.csi/rack": "rack2"},
+			},
+			topologyKeys: []map[string][]string{
+				{driverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+				{driverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+			},
+			expectedNodeAffinity: &v1.VolumeNodeAffinity{
+				Required: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "com.example.csi/zone",
+									Operator: v1.NodeSelectorOpIn,
+									Values:   []string{"zone1"},
+								},
+								{
+									Key:      "com.example.csi/rack",
+									Operator: v1.NodeSelectorOpIn,
+									Values:   []string{"rack2"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"topology fail": {
+			driverSupportsTopology: true,
+			topologyKeys: []map[string][]string{
+				{driverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+				{driverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+			},
+			expectError: true,
+		},
+		"driver doesn't support topology": {
+			driverSupportsTopology: false,
+			expectError:            false,
+		},
+	}
 
 	accessibleTopology := []*csi.Topology{
 		{
@@ -1515,29 +1627,90 @@ func TestProvisionWithTopology(t *testing.T) {
 			},
 		},
 	}
-	expectedNodeAffinity := &v1.VolumeNodeAffinity{
-		Required: &v1.NodeSelector{
-			NodeSelectorTerms: []v1.NodeSelectorTerm{
-				{
-					MatchExpressions: []v1.NodeSelectorRequirement{
-						{
-							Key:      "com.example.csi/zone",
-							Operator: v1.NodeSelectorOpIn,
-							Values:   []string{"zone1"},
-						},
-						{
-							Key:      "com.example.csi/rack",
-							Operator: v1.NodeSelectorOpIn,
-							Values:   []string{"rack2"},
-						},
-					},
-				},
+
+	createVolumeOut := &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			CapacityBytes:      requestBytes,
+			VolumeId:           "test-volume-id",
+			AccessibleTopology: accessibleTopology,
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			tmpdir := tempDir(t)
+			defer os.RemoveAll(tmpdir)
+			mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mockController.Finish()
+			defer driver.Stop()
+
+			if !tc.expectError {
+				controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(createVolumeOut, nil).Times(1)
+			}
+
+			nodes := buildNodes(tc.nodeLabels, k8sTopologyBetaVersion.String())
+			nodeInfos := buildNodeInfos(tc.topologyKeys)
+
+			var (
+				pluginCaps     connection.PluginCapabilitySet
+				controllerCaps connection.ControllerCapabilitySet
+			)
+
+			if tc.driverSupportsTopology {
+				pluginCaps, controllerCaps = provisionWithTopologyCapabilities()
+			} else {
+				pluginCaps, controllerCaps = provisionCapabilities()
+			}
+
+			clientSet := fakeclientset.NewSimpleClientset(nodes, nodeInfos)
+			csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+
+			pv, err := csiProvisioner.Provision(controller.VolumeOptions{
+				PVC: createFakePVC(requestBytes),
+			})
+			if !tc.expectError {
+				if err != nil {
+					t.Fatalf("test %q failed: got error from Provision call: %v", name, err)
+				}
+
+				if !volumeNodeAffinitiesEqual(pv.Spec.NodeAffinity, tc.expectedNodeAffinity) {
+					t.Errorf("test %q failed: expected node affinity %+v; got: %+v", name, tc.expectedNodeAffinity, pv.Spec.NodeAffinity)
+				}
+			}
+			if tc.expectError {
+				if err == nil {
+					t.Errorf("test %q failed: expected error from Provision call, got success", name)
+				}
+				if pv != nil {
+					t.Errorf("test %q failed: expected nil PV, got %+v", name, pv)
+				}
+			}
+		})
+	}
+}
+
+// TestProvisionWithTopologyDisabled checks that missing Node and CSINode objects, selectedNode
+// are ignored and topology is not set on the PV
+func TestProvisionWithTopologyDisabled(t *testing.T) {
+	defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, false)()
+
+	accessibleTopology := []*csi.Topology{
+		{
+			Segments: map[string]string{
+				"com.example.csi/zone": "zone1",
+				"com.example.csi/rack": "rack2",
 			},
 		},
 	}
 
 	const requestBytes = 100
-	mockController, driver, identityServer, controllerServer, csiConn, err := createMockServer(t)
+
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1545,28 +1718,72 @@ func TestProvisionWithTopology(t *testing.T) {
 	defer driver.Stop()
 
 	clientSet := fakeclientset.NewSimpleClientset()
-	csiClientSet := fakecsiclientset.NewSimpleClientset()
-	csiProvisioner := NewCSIProvisioner(clientSet, csiClientSet, driver.Address(), 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil)
+	pluginCaps, controllerCaps := provisionWithTopologyCapabilities()
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
 
 	out := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			CapacityBytes:      requestBytes,
-			Id:                 "test-volume-id",
+			VolumeId:           "test-volume-id",
 			AccessibleTopology: accessibleTopology,
 		},
 	}
 
-	provisionWithTopologyMockServerSetupExpectations(identityServer, controllerServer)
 	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 
 	pv, err := csiProvisioner.Provision(controller.VolumeOptions{
-		PVC: createFakePVC(requestBytes), // dummy PVC
+		PVC: createFakePVC(requestBytes),
+		SelectedNode: &v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "some-node",
+			},
+		},
 	})
 	if err != nil {
 		t.Errorf("got error from Provision call: %v", err)
 	}
 
-	if !volumeNodeAffinitiesEqual(pv.Spec.NodeAffinity, expectedNodeAffinity) {
-		t.Errorf("expected node affinity %v; got: %v", expectedNodeAffinity, pv.Spec.NodeAffinity)
+	if pv.Spec.NodeAffinity != nil {
+		t.Errorf("expected nil PV node affinity; got: %v", pv.Spec.NodeAffinity)
+	}
+}
+
+// TestProvisionWithMountOptions is a test of provisioner integration with mount options.
+func TestProvisionWithMountOptions(t *testing.T) {
+	expectedOptions := []string{"foo=bar", "baz=qux"}
+	const requestBytes = 100
+
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockController.Finish()
+	defer driver.Stop()
+
+	clientSet := fakeclientset.NewSimpleClientset()
+	pluginCaps, controllerCaps := provisionCapabilities()
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+
+	out := &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			CapacityBytes: requestBytes,
+			VolumeId:      "test-volume-id",
+		},
+	}
+
+	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+
+	pv, err := csiProvisioner.Provision(controller.VolumeOptions{
+		PVC:          createFakePVC(requestBytes), // dummy PVC
+		MountOptions: expectedOptions,
+	})
+	if err != nil {
+		t.Fatalf("got error from Provision call: %v", err)
+	}
+
+	if !reflect.DeepEqual(pv.Spec.MountOptions, expectedOptions) {
+		t.Errorf("expected mount options %v; got: %v", expectedOptions, pv.Spec.MountOptions)
 	}
 }
