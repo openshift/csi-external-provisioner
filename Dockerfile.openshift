@@ -5,6 +5,4 @@ RUN make build
 
 FROM registry.svc.ci.openshift.org/openshift/origin-v4.0:base
 COPY --from=builder /go/src/github.com/kubernetes-csi/external-provisioner/bin/csi-provisioner /usr/bin/
-RUN useradd csi-provisioner
-USER csi-provisioner
 ENTRYPOINT ["/usr/bin/csi-provisioner"]
