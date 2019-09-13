@@ -110,6 +110,8 @@ const (
 	tokenPVNameKey       = "pv.name"
 	tokenPVCNameKey      = "pvc.name"
 	tokenPVCNameSpaceKey = "pvc.namespace"
+
+	annStorageProvisioner = "volume.beta.kubernetes.io/storage-provisioner"
 )
 
 var (
@@ -338,6 +340,15 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 
 func (p *csiProvisioner) ProvisionExt(options controller.VolumeOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
 	createVolumeRequestParameters := options.Parameters
+
+	if options.PVC.Annotations[annStorageProvisioner] != p.driverName {
+		return nil, controller.ProvisioningFinished, &controller.IgnoredError{
+			Reason: fmt.Sprintf("PVC annotated with external-provisioner name %s does not match provisioner driver name %s. This could mean the PVC is not migrated",
+				options.PVC.Annotations[annStorageProvisioner],
+				p.driverName),
+		}
+	}
+
 	migratedVolume := false
 	if p.supportsMigrationFromInTreePluginName != "" {
 		storageClassName := options.PVC.Spec.StorageClassName
