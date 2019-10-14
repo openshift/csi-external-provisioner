@@ -351,15 +351,15 @@ func (p *csiProvisioner) ProvisionExt(options controller.VolumeOptions) (*v1.Per
 
 	migratedVolume := false
 	if p.supportsMigrationFromInTreePluginName != "" {
-		storageClassName := options.PVC.Spec.StorageClassName
+		storageClassName := util.GetPersistentVolumeClaimClass(options.PVC)
 		// TODO(https://github.com/kubernetes-csi/external-provisioner/issues/256): use informers
 		// NOTE: we cannot depend on PVC.Annotations[volume.beta.kubernetes.io/storage-provisioner] to get
 		// the in-tree provisioner name in case of CSI migration scenarios. The annotation will be
 		// set to the CSI provisioner name by PV controller for migration scenarios
 		// so that external provisioner can correctly pick up the PVC pointing to an in-tree plugin
-		storageClass, err := p.client.StorageV1().StorageClasses().Get(*storageClassName, metav1.GetOptions{})
+		storageClass, err := p.client.StorageV1().StorageClasses().Get(storageClassName, metav1.GetOptions{})
 		if err != nil {
-			return nil, controller.ProvisioningFinished, fmt.Errorf("failed to get storage class named %s: %v", *storageClassName, err)
+			return nil, controller.ProvisioningFinished, fmt.Errorf("failed to get storage class named %s: %v", storageClassName, err)
 		}
 		if storageClass.Provisioner == p.supportsMigrationFromInTreePluginName {
 			klog.V(2).Infof("translating storage class parameters for in-tree plugin %s to CSI", storageClass.Provisioner)
