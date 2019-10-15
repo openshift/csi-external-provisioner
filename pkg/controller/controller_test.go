@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -27,6 +28,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
@@ -35,20 +39,18 @@ import (
 	crdv1 "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1alpha1"
 	"github.com/kubernetes-csi/external-snapshotter/pkg/client/clientset/versioned/fake"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
-	storage "k8s.io/api/storage/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	utilfeaturetesting "k8s.io/apiserver/pkg/util/feature/testing"
 	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	utilfeaturetesting "k8s.io/component-base/featuregate/testing"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
 )
 
@@ -205,8 +207,8 @@ func TestStripPrefixedCSIParams(t *testing.T) {
 				prefixedNodeStageSecretNamespaceKey:         "csiBar",
 				prefixedNodePublishSecretNameKey:            "csiBar",
 				prefixedNodePublishSecretNamespaceKey:       "csiBar",
-				prefixedResizerSecretNameKey:                "csiBar",
-				prefixedResizerSecretNamespaceKey:           "csiBar",
+				prefixedControllerExpandSecretNameKey:       "csiBar",
+				prefixedControllerExpandSecretNamespaceKey:  "csiBar",
 			},
 			expectedParams: map[string]string{},
 		},
@@ -396,14 +398,17 @@ func TestCreateDriverReturnsInvalidCapacityDuringProvision(t *testing.T) {
 	defer driver.Stop()
 
 	pluginCaps, controllerCaps := provisionCapabilities()
-	csiProvisioner := NewCSIProvisioner(nil, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+	csiProvisioner := NewCSIProvisioner(nil, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "", false)
 
 	// Requested PVC with requestedBytes storage
-	opts := controller.VolumeOptions{
-		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-		PVName:                        "test-name",
-		PVC:                           createFakePVC(requestedBytes),
-		Parameters:                    map[string]string{},
+	deletePolicy := v1.PersistentVolumeReclaimDelete
+	opts := controller.ProvisionOptions{
+		StorageClass: &storagev1.StorageClass{
+			ReclaimPolicy: &deletePolicy,
+			Parameters:    map[string]string{},
+		},
+		PVName: "test-name",
+		PVC:    createFakePVC(requestedBytes),
 	}
 
 	// Drivers CreateVolume response with lower capacity bytes than request
@@ -456,11 +461,21 @@ func provisionWithTopologyCapabilities() (connection.PluginCapabilitySet, connec
 		}
 }
 
+func provisionFromPVCCapabilities() (connection.PluginCapabilitySet, connection.ControllerCapabilitySet) {
+	return connection.PluginCapabilitySet{
+			csi.PluginCapability_Service_CONTROLLER_SERVICE: true,
+		}, connection.ControllerCapabilitySet{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME: true,
+			csi.ControllerServiceCapability_RPC_CLONE_VOLUME:         true,
+		}
+}
+
 // Minimal PVC required for tests to function
 func createFakePVC(requestBytes int64) *v1.PersistentVolumeClaim {
 	return &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			UID:         "testid",
+			Name:        "fake-pvc",
 			Annotations: map[string]string{annStorageProvisioner: driverName},
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
@@ -481,9 +496,42 @@ func createFakePVCWithVolumeMode(requestBytes int64, volumeMode v1.PersistentVol
 	return claim
 }
 
+// fakeClaim returns a valid PVC with the requested settings
+func fakeClaim(name, claimUID, capacity, boundToVolume string, phase v1.PersistentVolumeClaimPhase, class *string) *v1.PersistentVolumeClaim {
+	claim := v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       "testns",
+			UID:             types.UID(claimUID),
+			ResourceVersion: "1",
+			SelfLink:        "/api/v1/namespaces/testns/persistentvolumeclaims/" + name,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany},
+			Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse(capacity),
+				},
+			},
+			VolumeName:       boundToVolume,
+			StorageClassName: class,
+		},
+		Status: v1.PersistentVolumeClaimStatus{
+			Phase: phase,
+		},
+	}
+
+	if phase == v1.ClaimBound {
+		claim.Status.AccessModes = claim.Spec.AccessModes
+		claim.Status.Capacity = claim.Spec.Resources.Requests
+	}
+
+	return &claim
+
+}
 func TestGetSecretReference(t *testing.T) {
 	testcases := map[string]struct {
-		secretParams deprecatedSecretParamsMap
+		secretParams secretParamsMap
 		params       map[string]string
 		pvName       string
 		pvc          *v1.PersistentVolumeClaim
@@ -560,6 +608,20 @@ func TestGetSecretReference(t *testing.T) {
 			pvc:          nil,
 			expectRef:    &v1.SecretReference{Name: "name", Namespace: "ns"},
 		},
+		"simple - valid, pvc name and namespace": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				provisionerSecretNameKey:      "param-name",
+				provisionerSecretNamespaceKey: "param-ns",
+			},
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+			},
+			expectRef: &v1.SecretReference{Name: "param-name", Namespace: "param-ns"},
+		},
 		"simple - invalid name": {
 			secretParams: nodePublishSecretParams,
 			params:       map[string]string{nodePublishSecretNameKey: "bad name", nodePublishSecretNamespaceKey: "ns"},
@@ -574,7 +636,20 @@ func TestGetSecretReference(t *testing.T) {
 			expectRef:    nil,
 			expectErr:    true,
 		},
-		"template - valid": {
+		"template - PVC name annotations not supported for Provision and Delete": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				prefixedProvisionerSecretNameKey: "static-${pv.name}-${pvc.namespace}-${pvc.name}-${pvc.annotations['akey']}",
+			},
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+			},
+			expectErr: true,
+		},
+		"template - valid nodepublish secret ref": {
 			secretParams: nodePublishSecretParams,
 			params: map[string]string{
 				nodePublishSecretNameKey:      "static-${pv.name}-${pvc.namespace}-${pvc.name}-${pvc.annotations['akey']}",
@@ -589,6 +664,63 @@ func TestGetSecretReference(t *testing.T) {
 				},
 			},
 			expectRef: &v1.SecretReference{Name: "static-pvname-pvcnamespace-pvcname-avalue", Namespace: "static-pvname-pvcnamespace"},
+		},
+		"template - valid provisioner secret ref": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				provisionerSecretNameKey:      "static-provisioner-${pv.name}-${pvc.namespace}-${pvc.name}",
+				provisionerSecretNamespaceKey: "static-provisioner-${pv.name}-${pvc.namespace}",
+			},
+			pvName: "pvname",
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pvcname",
+					Namespace: "pvcnamespace",
+				},
+			},
+			expectRef: &v1.SecretReference{Name: "static-provisioner-pvname-pvcnamespace-pvcname", Namespace: "static-provisioner-pvname-pvcnamespace"},
+		},
+		"template - valid, with pvc.name": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				provisionerSecretNameKey:      "${pvc.name}",
+				provisionerSecretNamespaceKey: "ns",
+			},
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pvcname",
+					Namespace: "pvcns",
+				},
+			},
+			expectRef: &v1.SecretReference{Name: "pvcname", Namespace: "ns"},
+		},
+		"template - valid, provisioner with pvc name and namepsace": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				provisionerSecretNameKey:      "${pvc.name}",
+				provisionerSecretNamespaceKey: "${pvc.namespace}",
+			},
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pvcname",
+					Namespace: "pvcns",
+				},
+			},
+			expectRef: &v1.SecretReference{Name: "pvcname", Namespace: "pvcns"},
+		},
+		"template - valid, static pvc name and templated namespace": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				provisionerSecretNameKey:      "static-name-1",
+				provisionerSecretNamespaceKey: "${pvc.namespace}",
+			},
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+			},
+			expectRef: &v1.SecretReference{Name: "static-name-1", Namespace: "ns"},
 		},
 		"template - invalid namespace tokens": {
 			secretParams: nodePublishSecretParams,
@@ -633,12 +765,13 @@ func TestGetSecretReference(t *testing.T) {
 }
 
 type provisioningTestcase struct {
-	volOpts           controller.VolumeOptions
+	volOpts           controller.ProvisionOptions
 	notNilSelector    bool
 	makeVolumeNameErr bool
 	getSecretRefErr   bool
 	getCredentialsErr bool
 	volWithLessCap    bool
+	volWithZeroCap    bool
 	expectedPVSpec    *pvSpec
 	withSecretRefs    bool
 	createVolumeError error
@@ -651,6 +784,7 @@ type pvSpec struct {
 	Name          string
 	ReclaimPolicy v1.PersistentVolumeReclaimPolicy
 	AccessModes   []v1.PersistentVolumeAccessMode
+	MountOptions  []string
 	VolumeMode    *v1.PersistentVolumeMode
 	Capacity      v1.ResourceList
 	CSIPVS        *v1.CSIPersistentVolumeSource
@@ -658,15 +792,18 @@ type pvSpec struct {
 
 func TestProvision(t *testing.T) {
 	var requestedBytes int64 = 100
+	deletePolicy := v1.PersistentVolumeReclaimDelete
 	testcases := map[string]provisioningTestcase{
 		"normal provision": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
-				PVC:                           createFakePVC(requestedBytes),
-				Parameters: map[string]string{
-					"fstype": "ext3",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters: map[string]string{
+						"fstype": "ext3",
+					},
 				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -686,26 +823,30 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"multiple fsType provision": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
-				PVC:                           createFakePVC(requestedBytes),
-				Parameters: map[string]string{
-					"fstype":          "ext3",
-					prefixedFsTypeKey: "ext4",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters: map[string]string{
+						"fstype":          "ext3",
+						prefixedFsTypeKey: "ext4",
+					},
 				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			expectErr:   true,
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with prefixed FS Type key": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
-				PVC:                           createFakePVC(requestedBytes),
-				Parameters: map[string]string{
-					prefixedFsTypeKey: "ext3",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters: map[string]string{
+						prefixedFsTypeKey: "ext3",
+					},
 				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -730,9 +871,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with access mode multi node multi writer": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -748,7 +892,6 @@ func TestProvision(t *testing.T) {
 						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteMany},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -780,9 +923,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with access mode multi node multi readonly": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -798,7 +944,6 @@ func TestProvision(t *testing.T) {
 						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -830,9 +975,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with access mode single writer": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -848,7 +996,6 @@ func TestProvision(t *testing.T) {
 						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -880,9 +1027,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with multiple access modes": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -898,7 +1048,6 @@ func TestProvision(t *testing.T) {
 						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadOnlyMany, v1.ReadWriteOnce},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
@@ -936,10 +1085,13 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with secrets": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVC(requestedBytes),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			withSecretRefs: true,
 			expectedPVSpec: &pvSpec{
@@ -947,6 +1099,7 @@ func TestProvision(t *testing.T) {
 				Capacity: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
 				},
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 				CSIPVS: &v1.CSIPersistentVolumeSource{
 					Driver:       "test-driver",
 					VolumeHandle: "test-volume-id",
@@ -966,22 +1119,30 @@ func TestProvision(t *testing.T) {
 						Name:      "nodepublishsecret",
 						Namespace: "default",
 					},
+					ControllerExpandSecretRef: &v1.SecretReference{
+						Name:      "controllerexpandsecret",
+						Namespace: "default",
+					},
 				},
 			},
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with volume mode(Filesystem)": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVCWithVolumeMode(requestedBytes, volumeModeFileSystem),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVCWithVolumeMode(requestedBytes, volumeModeFileSystem),
 			},
 			expectedPVSpec: &pvSpec{
 				Name: "test-testi",
 				Capacity: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
 				},
-				VolumeMode: &volumeModeFileSystem,
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				VolumeMode:    &volumeModeFileSystem,
 				CSIPVS: &v1.CSIPersistentVolumeSource{
 					Driver:       "test-driver",
 					VolumeHandle: "test-volume-id",
@@ -994,17 +1155,21 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with volume mode(Block)": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVCWithVolumeMode(requestedBytes, volumeModeBlock),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVCWithVolumeMode(requestedBytes, volumeModeBlock),
 			},
 			expectedPVSpec: &pvSpec{
 				Name: "test-testi",
 				Capacity: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
 				},
-				VolumeMode: &volumeModeBlock,
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				VolumeMode:    &volumeModeBlock,
 				CSIPVS: &v1.CSIPersistentVolumeSource{
 					Driver:       "test-driver",
 					VolumeHandle: "test-volume-id",
@@ -1016,17 +1181,19 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"fail to get secret reference": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVC(requestedBytes),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			getSecretRefErr: true,
 			expectErr:       true,
 			expectState:     controller.ProvisioningNoChange,
 		},
 		"fail not nil selector": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
 				PVName: "test-name",
 				PVC:    createFakePVC(requestedBytes),
 			},
@@ -1035,7 +1202,7 @@ func TestProvision(t *testing.T) {
 			expectState:    controller.ProvisioningFinished,
 		},
 		"fail to make volume name": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
 				PVName: "test-name",
 				PVC:    createFakePVC(requestedBytes),
 			},
@@ -1044,29 +1211,37 @@ func TestProvision(t *testing.T) {
 			expectState:       controller.ProvisioningFinished,
 		},
 		"fail to get credentials": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVC(requestedBytes),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			getCredentialsErr: true,
 			expectErr:         true,
 			expectState:       controller.ProvisioningNoChange,
 		},
 		"fail vol with less capacity": {
-			volOpts: controller.VolumeOptions{
-				PVName:     "test-name",
-				PVC:        createFakePVC(requestedBytes),
-				Parameters: map[string]string{},
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
 			},
 			volWithLessCap: true,
 			expectErr:      true,
 			expectState:    controller.ProvisioningInBackground,
 		},
 		"provision with mount options": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:    map[string]string{},
+					MountOptions:  []string{"foo=bar", "baz=qux"},
+					ReclaimPolicy: &deletePolicy,
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -1082,13 +1257,12 @@ func TestProvision(t *testing.T) {
 						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
 					},
 				},
-				MountOptions: []string{"foo=bar", "baz=qux"},
-				Parameters:   map[string]string{},
 			},
 			expectedPVSpec: &pvSpec{
 				Name:          "test-testi",
 				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 				AccessModes:   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+				MountOptions:  []string{"foo=bar", "baz=qux"},
 				Capacity: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
 				},
@@ -1122,9 +1296,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with final error": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:    map[string]string{},
+					ReclaimPolicy: &deletePolicy,
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -1149,9 +1326,12 @@ func TestProvision(t *testing.T) {
 			expectState: controller.ProvisioningFinished,
 		},
 		"provision with transient error": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:    map[string]string{},
+					ReclaimPolicy: &deletePolicy,
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -1175,10 +1355,38 @@ func TestProvision(t *testing.T) {
 			expectErr:   true,
 			expectState: controller.ProvisioningInBackground,
 		},
+		"provision with size 0": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{
+						"fstype": "ext3",
+					},
+					ReclaimPolicy: &deletePolicy,
+				},
+				PVName: "test-name",
+				PVC:    createFakePVC(requestedBytes),
+			},
+			volWithZeroCap: true,
+			expectedPVSpec: &pvSpec{
+				Name:          "test-testi",
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext3",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+		},
 	}
 
 	for k, tc := range testcases {
-		runProvisionTest(t, k, tc, requestedBytes, driverName, "" /*no migration */)
+		runProvisionTest(t, k, tc, requestedBytes, driverName, "" /* no migration */)
 	}
 }
 
@@ -1190,9 +1398,15 @@ func TestProvisionWithMigration(t *testing.T) {
 	deletePolicy := v1.PersistentVolumeReclaimDelete
 	testcases := map[string]provisioningTestcase{
 		"should ignore in-tree with migration": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: deletePolicy,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Provisioner: inTreePluginName,
+					Parameters: map[string]string{
+						"fstype": "ext3",
+					},
+					ReclaimPolicy: &deletePolicy,
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
@@ -1219,7 +1433,7 @@ func TestProvisionWithMigration(t *testing.T) {
 }
 
 // newSnapshot returns a new snapshot object
-func newSnapshot(name, className, boundToContent, snapshotUID, claimName string, ready bool, err *storage.VolumeError, creationTime *metav1.Time, size *resource.Quantity) *crdv1.VolumeSnapshot {
+func newSnapshot(name, className, boundToContent, snapshotUID, claimName string, ready bool, err *storagev1beta1.VolumeError, creationTime *metav1.Time, size *resource.Quantity) *crdv1.VolumeSnapshot {
 	snapshot := crdv1.VolumeSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -1229,7 +1443,7 @@ func newSnapshot(name, className, boundToContent, snapshotUID, claimName string,
 			SelfLink:        "/apis/snapshot.storage.k8s.io/v1alpha1/namespaces/" + "default" + "/volumesnapshots/" + name,
 		},
 		Spec: crdv1.VolumeSnapshotSpec{
-			Source: &corev1.TypedLocalObjectReference{
+			Source: &v1.TypedLocalObjectReference{
 				Name: claimName,
 				Kind: "PersistentVolumeClaim",
 			},
@@ -1277,13 +1491,18 @@ func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requested
 				Name:      "nodepublishsecret",
 				Namespace: "default",
 			},
+		}, &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "controllerexpandsecret",
+				Namespace: "default",
+			},
 		})
 	} else {
 		clientSet = fakeclientset.NewSimpleClientset()
 	}
 
 	pluginCaps, controllerCaps := provisionCapabilities()
-	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, provisionDriverName, pluginCaps, controllerCaps, supportsMigrationFromInTreePluginName)
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, provisionDriverName, pluginCaps, controllerCaps, supportsMigrationFromInTreePluginName, false)
 
 	out := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -1293,12 +1512,14 @@ func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requested
 	}
 
 	if tc.withSecretRefs {
-		tc.volOpts.Parameters[controllerPublishSecretNameKey] = "ctrlpublishsecret"
-		tc.volOpts.Parameters[controllerPublishSecretNamespaceKey] = "default"
-		tc.volOpts.Parameters[nodeStageSecretNameKey] = "nodestagesecret"
-		tc.volOpts.Parameters[nodeStageSecretNamespaceKey] = "default"
-		tc.volOpts.Parameters[nodePublishSecretNameKey] = "nodepublishsecret"
-		tc.volOpts.Parameters[nodePublishSecretNamespaceKey] = "default"
+		tc.volOpts.StorageClass.Parameters[controllerPublishSecretNameKey] = "ctrlpublishsecret"
+		tc.volOpts.StorageClass.Parameters[controllerPublishSecretNamespaceKey] = "default"
+		tc.volOpts.StorageClass.Parameters[nodeStageSecretNameKey] = "nodestagesecret"
+		tc.volOpts.StorageClass.Parameters[nodeStageSecretNamespaceKey] = "default"
+		tc.volOpts.StorageClass.Parameters[nodePublishSecretNameKey] = "nodepublishsecret"
+		tc.volOpts.StorageClass.Parameters[nodePublishSecretNamespaceKey] = "default"
+		tc.volOpts.StorageClass.Parameters[prefixedControllerExpandSecretNameKey] = "controllerexpandsecret"
+		tc.volOpts.StorageClass.Parameters[prefixedControllerExpandSecretNamespaceKey] = "default"
 	}
 
 	if tc.notNilSelector {
@@ -1306,14 +1527,17 @@ func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requested
 	} else if tc.makeVolumeNameErr {
 		tc.volOpts.PVC.ObjectMeta.UID = ""
 	} else if tc.getSecretRefErr {
-		tc.volOpts.Parameters[provisionerSecretNameKey] = ""
+		tc.volOpts.StorageClass.Parameters[provisionerSecretNameKey] = ""
 	} else if tc.getCredentialsErr {
-		tc.volOpts.Parameters[provisionerSecretNameKey] = "secretx"
-		tc.volOpts.Parameters[provisionerSecretNamespaceKey] = "default"
+		tc.volOpts.StorageClass.Parameters[provisionerSecretNameKey] = "secretx"
+		tc.volOpts.StorageClass.Parameters[provisionerSecretNamespaceKey] = "default"
 	} else if tc.volWithLessCap {
 		out.Volume.CapacityBytes = int64(80)
 		controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, tc.createVolumeError).Times(1)
 		controllerServer.EXPECT().DeleteVolume(gomock.Any(), gomock.Any()).Return(&csi.DeleteVolumeResponse{}, tc.createVolumeError).Times(1)
+	} else if tc.volWithZeroCap {
+		out.Volume.CapacityBytes = int64(0)
+		controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 	} else if tc.expectCreateVolDo != nil {
 		controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Do(tc.expectCreateVolDo).Return(out, tc.createVolumeError).Times(1)
 	} else {
@@ -1328,7 +1552,7 @@ func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requested
 		t.Errorf("test %q: Expected error, got none", k)
 	}
 	if !tc.expectErr && err != nil {
-		t.Errorf("test %q: got error: %v", k, err)
+		t.Fatalf("test %q: got error: %v", k, err)
 	}
 
 	if tc.expectState == "" {
@@ -1357,6 +1581,10 @@ func runProvisionTest(t *testing.T, k string, tc provisioningTestcase, requested
 
 		if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
 			t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
+		}
+
+		if !reflect.DeepEqual(pv.Spec.MountOptions, tc.expectedPVSpec.MountOptions) {
+			t.Errorf("test %q: expected mount options: %v, got: %v", k, tc.expectedPVSpec.MountOptions, pv.Spec.MountOptions)
 		}
 
 		if tc.expectedPVSpec.CSIPVS != nil {
@@ -1417,6 +1645,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	var metaTimeNowUnix = &metav1.Time{
 		Time: time.Unix(0, timeNow),
 	}
+	deletePolicy := v1.PersistentVolumeReclaimDelete
 
 	type pvSpec struct {
 		Name          string
@@ -1427,24 +1656,33 @@ func TestProvisionFromSnapshot(t *testing.T) {
 	}
 
 	testcases := map[string]struct {
-		volOpts              controller.VolumeOptions
-		restoredVolSizeSmall bool
-		wrongDataSource      bool
-		snapshotStatusReady  bool
-		expectedPVSpec       *pvSpec
-		expectErr            bool
+		volOpts                          controller.ProvisionOptions
+		restoredVolSizeSmall             bool
+		wrongDataSource                  bool
+		snapshotStatusReady              bool
+		expectedPVSpec                   *pvSpec
+		expectErr                        bool
+		expectCSICall                    bool
+		notPopulated                     bool
+		misBoundSnapshotContentUID       bool
+		misBoundSnapshotContentNamespace bool
+		misBoundSnapshotContentName      bool
 	}{
 		"provision with volume snapshot data source": {
-			volOpts: controller.VolumeOptions{
-				PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-				PVName:                        "test-name",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   "test-driver",
+				},
+				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						UID:         "testid",
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
@@ -1458,7 +1696,6 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			snapshotStatusReady: true,
 			expectedPVSpec: &pvSpec{
@@ -1477,9 +1714,14 @@ func TestProvisionFromSnapshot(t *testing.T) {
 					},
 				},
 			},
+			expectCSICall: true,
 		},
 		"fail vol size less than snapshot size": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
 				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1487,7 +1729,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(100, 10)),
@@ -1501,14 +1743,17 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			restoredVolSizeSmall: true,
 			snapshotStatusReady:  true,
 			expectErr:            true,
 		},
 		"fail empty snapshot name": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
 				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1516,7 +1761,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
@@ -1530,13 +1775,16 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			wrongDataSource: true,
 			expectErr:       true,
 		},
 		"fail unsupported datasource kind": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
 				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1544,7 +1792,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
@@ -1558,13 +1806,16 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			wrongDataSource: true,
 			expectErr:       true,
 		},
 		"fail unsupported apigroup": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
 				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1572,7 +1823,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
@@ -1586,13 +1837,16 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			wrongDataSource: true,
 			expectErr:       true,
 		},
 		"fail invalid snapshot status": {
-			volOpts: controller.VolumeOptions{
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
 				PVName: "test-name",
 				PVC: &v1.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1600,7 +1854,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						Annotations: driverNameAnnotation,
 					},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Selector: nil,
+						StorageClassName: &snapClassName,
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(100, 10)),
@@ -1614,9 +1868,168 @@ func TestProvisionFromSnapshot(t *testing.T) {
 						},
 					},
 				},
-				Parameters: map[string]string{},
 			},
 			snapshotStatusReady: false,
+			expectErr:           true,
+		},
+		"fail not populated volume content source": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &snapClassName,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name:     snapName,
+							Kind:     "VolumeSnapshot",
+							APIGroup: &apiGrp,
+						},
+					},
+				},
+			},
+			snapshotStatusReady: true,
+			expectErr:           true,
+			expectCSICall:       true,
+			notPopulated:        true,
+		},
+		"fail snapshotContent bound to a different snapshot (by UID)": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &snapClassName,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name:     snapName,
+							Kind:     "VolumeSnapshot",
+							APIGroup: &apiGrp,
+						},
+					},
+				},
+			},
+			snapshotStatusReady:        true,
+			expectErr:                  true,
+			misBoundSnapshotContentUID: true,
+		},
+		"fail snapshotContent bound to a different snapshot (by namespace)": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &snapClassName,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name:     snapName,
+							Kind:     "VolumeSnapshot",
+							APIGroup: &apiGrp,
+						},
+					},
+				},
+			},
+			snapshotStatusReady:              true,
+			expectErr:                        true,
+			misBoundSnapshotContentNamespace: true,
+		},
+		"fail snapshotContent bound to a different snapshot (by name)": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "test-driver",
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &snapClassName,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name:     snapName,
+							Kind:     "VolumeSnapshot",
+							APIGroup: &apiGrp,
+						},
+					},
+				},
+			},
+			snapshotStatusReady:         true,
+			expectErr:                   true,
+			misBoundSnapshotContentName: true,
+		},
+		"fail snapshotContent uses different driver than StorageClass": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters:  map[string]string{},
+					Provisioner: "another-driver",
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &snapClassName,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name:     snapName,
+							Kind:     "VolumeSnapshot",
+							APIGroup: &apiGrp,
+						},
+					},
+				},
+			},
+			snapshotStatusReady: true,
 			expectErr:           true,
 		},
 	}
@@ -1642,11 +2055,20 @@ func TestProvisionFromSnapshot(t *testing.T) {
 
 		client.AddReactor("get", "volumesnapshotcontents", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 			content := newContent("snapcontent-snapuid", snapClassName, "sid", "pv-uid", "volume", "snapuid", snapName, &requestedBytes, &timeNow)
+			if tc.misBoundSnapshotContentUID {
+				content.Spec.VolumeSnapshotRef.UID = "another-snapshot-uid"
+			}
+			if tc.misBoundSnapshotContentName {
+				content.Spec.VolumeSnapshotRef.Name = "another-snapshot-name"
+			}
+			if tc.misBoundSnapshotContentNamespace {
+				content.Spec.VolumeSnapshotRef.Namespace = "another-snapshot-namespace"
+			}
 			return true, content, nil
 		})
 
 		pluginCaps, controllerCaps := provisionFromSnapshotCapabilities()
-		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, client, driverName, pluginCaps, controllerCaps, "")
+		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, client, driverName, pluginCaps, controllerCaps, "", false)
 
 		out := &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
@@ -1661,8 +2083,24 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		// early and therefore CreateVolume is not expected to be called.
 		// When the following if condition is met, it is a valid create volume from snapshot
 		// operation and CreateVolume is expected to be called.
-		if tc.restoredVolSizeSmall == false && tc.wrongDataSource == false && tc.snapshotStatusReady {
-			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		if tc.expectCSICall {
+			if tc.notPopulated {
+				out.Volume.ContentSource = nil
+				controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+				controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
+					VolumeId: "test-volume-id",
+				}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+			} else {
+				snapshotSource := csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{
+						SnapshotId: "sid",
+					},
+				}
+				out.Volume.ContentSource = &csi.VolumeContentSource{
+					Type: &snapshotSource,
+				}
+				controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+			}
 		}
 
 		pv, err := csiProvisioner.Provision(tc.volOpts)
@@ -1675,17 +2113,19 @@ func TestProvisionFromSnapshot(t *testing.T) {
 		}
 
 		if tc.expectedPVSpec != nil {
-			if pv.Name != tc.expectedPVSpec.Name {
-				t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
-			}
+			if pv != nil {
+				if pv.Name != tc.expectedPVSpec.Name {
+					t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
+				}
 
-			if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
-				t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
-			}
+				if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
+					t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
+				}
 
-			if tc.expectedPVSpec.CSIPVS != nil {
-				if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
-					t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
+				if tc.expectedPVSpec.CSIPVS != nil {
+					if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
+						t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
+					}
 				}
 			}
 		}
@@ -1797,10 +2237,11 @@ func TestProvisionWithTopologyEnabled(t *testing.T) {
 			}
 
 			clientSet := fakeclientset.NewSimpleClientset(nodes, nodeInfos)
-			csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+			csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "", false)
 
-			pv, err := csiProvisioner.Provision(controller.VolumeOptions{
-				PVC: createFakePVC(requestBytes),
+			pv, err := csiProvisioner.Provision(controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{},
+				PVC:          createFakePVC(requestBytes),
 			})
 			if !tc.expectError {
 				if err != nil {
@@ -1850,7 +2291,7 @@ func TestProvisionWithTopologyDisabled(t *testing.T) {
 
 	clientSet := fakeclientset.NewSimpleClientset()
 	pluginCaps, controllerCaps := provisionWithTopologyCapabilities()
-	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "", false)
 
 	out := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -1862,16 +2303,18 @@ func TestProvisionWithTopologyDisabled(t *testing.T) {
 
 	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 
-	pv, err := csiProvisioner.Provision(controller.VolumeOptions{
-		PVC: createFakePVC(requestBytes),
+	pv, err := csiProvisioner.Provision(controller.ProvisionOptions{
+		StorageClass: &storagev1.StorageClass{},
+		PVC:          createFakePVC(requestBytes),
 		SelectedNode: &v1.Node{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "some-node",
 			},
 		},
 	})
+
 	if err != nil {
-		t.Errorf("got error from Provision call: %v", err)
+		t.Fatalf("got error from Provision call: %v", err)
 	}
 
 	if pv.Spec.NodeAffinity != nil {
@@ -1879,10 +2322,705 @@ func TestProvisionWithTopologyDisabled(t *testing.T) {
 	}
 }
 
-// TestProvisionWithMountOptions is a test of provisioner integration with mount options.
-func TestProvisionWithMountOptions(t *testing.T) {
-	expectedOptions := []string{"foo=bar", "baz=qux"}
-	const requestBytes = 100
+type deleteTestcase struct {
+	persistentVolume *v1.PersistentVolume
+	storageClass     *storagev1.StorageClass
+	mockDelete       bool
+	expectErr        bool
+}
+
+// TestDelete is a test of the delete operation
+func TestDelete(t *testing.T) {
+	tt := map[string]deleteTestcase{
+		"fail - nil PV": deleteTestcase{
+			persistentVolume: nil,
+			expectErr:        true,
+		},
+		"fail - nil volume.Spec.CSI": deleteTestcase{
+			persistentVolume: &v1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pv",
+					Namespace: "ns",
+					Annotations: map[string]string{
+						prefixedProvisionerSecretNameKey: "static-${pv.name}-${pvc.namespace}-${pvc.name}-${pvc.annotations['akey']}",
+					},
+				},
+				Spec: v1.PersistentVolumeSpec{
+					PersistentVolumeSource: v1.PersistentVolumeSource{},
+				},
+			},
+			expectErr: true,
+		},
+		"fail - pvc.annotations not supported": deleteTestcase{
+			persistentVolume: &v1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pv",
+					Namespace: "ns",
+				},
+				Spec: v1.PersistentVolumeSpec{
+					PersistentVolumeSource: v1.PersistentVolumeSource{
+						CSI: &v1.CSIPersistentVolumeSource{
+							VolumeHandle: "vol-id-1",
+						},
+					},
+					ClaimRef: &v1.ObjectReference{
+						Name:      "sc-name",
+						Namespace: "ns",
+					},
+					StorageClassName: "sc-name",
+				},
+			},
+			storageClass: &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sc-name",
+					Namespace: "ns",
+				},
+				Parameters: map[string]string{
+					prefixedProvisionerSecretNameKey: "static-${pv.name}-${pvc.namespace}-${pvc.name}-${pvc.annotations['akey']}",
+				},
+			},
+			expectErr: true,
+		},
+		"simple - valid case": deleteTestcase{
+			persistentVolume: &v1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pv",
+					Namespace: "ns",
+				},
+				Spec: v1.PersistentVolumeSpec{
+					PersistentVolumeSource: v1.PersistentVolumeSource{
+						CSI: &v1.CSIPersistentVolumeSource{
+							VolumeHandle: "vol-id-1",
+						},
+					},
+				},
+			},
+			storageClass: &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sc-name",
+					Namespace: "ns",
+				},
+				Parameters: map[string]string{
+					prefixedProvisionerSecretNameKey: "static-${pv.name}-${pvc.namespace}-${pvc.name}",
+				},
+			},
+			expectErr:  false,
+			mockDelete: true,
+		},
+		"simple - valid case with ClaimRef set": deleteTestcase{
+			persistentVolume: &v1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pv",
+					Namespace: "ns",
+				},
+				Spec: v1.PersistentVolumeSpec{
+					PersistentVolumeSource: v1.PersistentVolumeSource{
+						CSI: &v1.CSIPersistentVolumeSource{
+							VolumeHandle: "vol-id-1",
+						},
+					},
+					ClaimRef: &v1.ObjectReference{
+						Name:      "pvc-name",
+						Namespace: "ns",
+					},
+				},
+			},
+			storageClass: &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sc-name",
+					Namespace: "ns",
+				},
+				Parameters: map[string]string{
+					prefixedProvisionerSecretNameKey: "static-${pv.name}-${pvc.namespace}-${pvc.name}",
+				},
+			},
+			expectErr:  false,
+			mockDelete: true,
+		},
+	}
+
+	for k, tc := range tt {
+		runDeleteTest(t, k, tc)
+	}
+}
+
+func runDeleteTest(t *testing.T, k string, tc deleteTestcase) {
+	t.Logf("Running test: %v", k)
+
+	tmpdir := tempDir(t)
+
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockController.Finish()
+	defer driver.Stop()
+
+	var clientSet *fakeclientset.Clientset
+
+	if tc.storageClass != nil {
+		clientSet = fakeclientset.NewSimpleClientset(tc.storageClass)
+	} else {
+		clientSet = fakeclientset.NewSimpleClientset()
+	}
+
+	if tc.mockDelete {
+		controllerServer.EXPECT().DeleteVolume(gomock.Any(), gomock.Any()).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+	}
+
+	pluginCaps, controllerCaps := provisionCapabilities()
+	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "", false)
+
+	err = csiProvisioner.Delete(tc.persistentVolume)
+	if tc.expectErr && err == nil {
+		t.Errorf("test %q: Expected error, got none", k)
+	}
+	if !tc.expectErr && err != nil {
+		t.Errorf("test %q: got error: %v", k, err)
+	}
+}
+
+// TestProvisionFromPVC tests create volume clone
+func TestProvisionFromPVC(t *testing.T) {
+	var requestedBytes int64 = 1000
+	fakeSc1 := "fake-sc-1"
+	fakeSc2 := "fake-sc-2"
+	srcName := "fake-pvc"
+	invalidPVC := "invalid-pv"
+	pvName := "test-testi"
+	unboundPVName := "unbound-pv"
+	anotherDriverPVName := "another-class"
+	wrongPVCName := "pv-bound-to-another-pvc-by-name"
+	wrongPVCNamespace := "pv-bound-to-another-pvc-by-namespace"
+	wrongPVCUID := "pv-bound-to-another-pvc-by-UID"
+	deletePolicy := v1.PersistentVolumeReclaimDelete
+
+	type pvSpec struct {
+		Name          string
+		ReclaimPolicy v1.PersistentVolumeReclaimPolicy
+		AccessModes   []v1.PersistentVolumeAccessMode
+		Capacity      v1.ResourceList
+		CSIPVS        *v1.CSIPersistentVolumeSource
+	}
+
+	testcases := map[string]struct {
+		volOpts              controller.ProvisionOptions
+		clonePVName          string
+		restoredVolSizeSmall bool
+		restoredVolSizeBig   bool
+		wrongDataSource      bool
+		pvcStatusReady       bool
+		expectedPVSpec       *pvSpec
+		cloneSupport         bool
+		expectErr            bool
+	}{
+		"provision with pvc data source": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: &pvSpec{
+				Name:          pvName,
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				AccessModes:   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext4",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+			cloneSupport: true,
+		},
+		"provision with pvc data source no clone capability": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: map[string]string{annStorageProvisioner: driverName},
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   false,
+			expectErr:      true,
+		},
+		"provision with pvc data source different storage classes": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: map[string]string{annStorageProvisioner: driverName},
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc2,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with pvc data source destination too small": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: map[string]string{annStorageProvisioner: driverName},
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady:       true,
+			restoredVolSizeSmall: true,
+			expectedPVSpec:       nil,
+			cloneSupport:         true,
+			expectErr:            true,
+		},
+		"provision with pvc data source destination too large": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady:     true,
+			restoredVolSizeBig: true,
+			expectedPVSpec:     nil,
+			cloneSupport:       true,
+			expectErr:          true,
+		},
+		"provision with pvc data source not found": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes-1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: "source-not-found",
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with source pvc storageclass nil": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector:         nil,
+						StorageClassName: &fakeSc1,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes-1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: "pvc-sc-nil",
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with requested pvc storageclass nil": {
+			clonePVName: pvName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes-1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with pvc data source when source pv not found": {
+			clonePVName: "invalid-pv",
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: invalidPVC,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with PVC using unbound PV": {
+			clonePVName: unboundPVName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with PVC using PV bound to another PVC (with wrong UID)": {
+			clonePVName: wrongPVCUID,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with PVC using PV bound to another PVC (with wrong namespace)": {
+			clonePVName: wrongPVCNamespace,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with PVC using PV bound to another PVC (with wrong name)": {
+			clonePVName: wrongPVCName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+		"provision with PVC bound to PV with wrong provisioner": {
+			clonePVName: anotherDriverPVName,
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+					Provisioner:   driverName,
+				},
+				PVName: "new-pv-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:         "testid",
+						Annotations: driverNameAnnotation,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						StorageClassName: &fakeSc1,
+						Selector:         nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes+1, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: nil,
+			cloneSupport:   true,
+			expectErr:      true,
+		},
+	}
 
 	tmpdir := tempDir(t)
 	defer os.RemoveAll(tmpdir)
@@ -1893,28 +3031,127 @@ func TestProvisionWithMountOptions(t *testing.T) {
 	defer mockController.Finish()
 	defer driver.Stop()
 
-	clientSet := fakeclientset.NewSimpleClientset()
-	pluginCaps, controllerCaps := provisionCapabilities()
-	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "")
+	for k, tc := range testcases {
+		var requestedBytes int64 = 1000
+		var clientSet *fakeclientset.Clientset
 
-	out := &csi.CreateVolumeResponse{
-		Volume: &csi.Volume{
-			CapacityBytes: requestBytes,
-			VolumeId:      "test-volume-id",
-		},
-	}
+		out := &csi.CreateVolumeResponse{
+			Volume: &csi.Volume{
+				CapacityBytes: requestedBytes,
+				VolumeId:      "test-volume-id",
+			},
+		}
 
-	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		clientSet = fakeclientset.NewSimpleClientset()
 
-	pv, err := csiProvisioner.Provision(controller.VolumeOptions{
-		PVC:          createFakePVC(requestBytes), // dummy PVC
-		MountOptions: expectedOptions,
-	})
-	if err != nil {
-		t.Fatalf("got error from Provision call: %v", err)
-	}
+		pv := &v1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: pvName,
+			},
+			Spec: v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					CSI: &v1.CSIPersistentVolumeSource{
+						Driver:       driverName,
+						VolumeHandle: "test-volume-id",
+						FSType:       "ext3",
+						VolumeAttributes: map[string]string{
+							"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+						},
+					},
+				},
+				ClaimRef: &v1.ObjectReference{
+					Kind:      "PersistentVolumeClaim",
+					Namespace: "testns",
+					Name:      srcName,
+					UID:       types.UID("fake-claim-uid"),
+				},
+				StorageClassName: fakeSc1,
+			},
+		}
 
-	if !reflect.DeepEqual(pv.Spec.MountOptions, expectedOptions) {
-		t.Errorf("expected mount options %v; got: %v", expectedOptions, pv.Spec.MountOptions)
+		unboundPV := pv.DeepCopy()
+		unboundPV.Name = unboundPVName
+		unboundPV.Spec.ClaimRef = nil
+
+		anotherDriverPV := pv.DeepCopy()
+		anotherDriverPV.Name = anotherDriverPVName
+		anotherDriverPV.Spec.CSI.Driver = "wrong.com"
+
+		pvBoundToAnotherPVCUID := pv.DeepCopy()
+		pvBoundToAnotherPVCUID.Name = wrongPVCUID
+		pvBoundToAnotherPVCUID.Spec.ClaimRef.UID = "another-claim-uid"
+
+		pvBoundToAnotherPVCNamespace := pv.DeepCopy()
+		pvBoundToAnotherPVCNamespace.Name = wrongPVCNamespace
+		pvBoundToAnotherPVCNamespace.Spec.ClaimRef.Namespace = "another-claim-namespace"
+
+		pvBoundToAnotherPVCName := pv.DeepCopy()
+		pvBoundToAnotherPVCName.Name = wrongPVCName
+		pvBoundToAnotherPVCName.Spec.ClaimRef.Name = "another-claim-name"
+
+		// Create a fake claim as our PVC DataSource
+		claim := fakeClaim(srcName, "fake-claim-uid", "1Gi", tc.clonePVName, v1.ClaimBound, &fakeSc1)
+		// Create a fake claim with invalid PV
+		invalidClaim := fakeClaim(invalidPVC, "fake-claim-uid", "1Gi", "pv-not-present", v1.ClaimBound, &fakeSc1)
+		/// Create a fake claim as source PVC storageclass nil
+		scNilClaim := fakeClaim("pvc-sc-nil", "fake-claim-uid", "1Gi", pvName, v1.ClaimBound, nil)
+		clientSet = fakeclientset.NewSimpleClientset(claim, scNilClaim, pv, invalidClaim, unboundPV, anotherDriverPV, pvBoundToAnotherPVCUID, pvBoundToAnotherPVCNamespace, pvBoundToAnotherPVCName)
+
+		pluginCaps, controllerCaps := provisionFromPVCCapabilities()
+		if !tc.cloneSupport {
+			pluginCaps, controllerCaps = provisionCapabilities()
+		}
+		if !tc.expectErr {
+			volumeSource := csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{
+					VolumeId: tc.volOpts.PVC.Spec.DataSource.Name,
+				},
+			}
+			out.Volume.ContentSource = &csi.VolumeContentSource{
+				Type: &volumeSource,
+			}
+			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		}
+		if tc.restoredVolSizeSmall {
+			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+			// if the volume created is less than the requested size,
+			// deletevolume will be called
+			controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
+				VolumeId: "test-volume-id",
+			}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+		}
+
+		if tc.restoredVolSizeBig {
+			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(nil, errors.New("source volume size is bigger than requested volume size")).Times(1)
+		}
+
+		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, nil, driverName, pluginCaps, controllerCaps, "", false)
+
+		pv, err := csiProvisioner.Provision(tc.volOpts)
+		if tc.expectErr && err == nil {
+			t.Errorf("test %q: Expected error, got none", k)
+		}
+
+		if !tc.expectErr && err != nil {
+			t.Errorf("test %q: got error: %v", k, err)
+		}
+
+		if tc.expectedPVSpec != nil {
+			if pv != nil {
+				if pv.Name != tc.expectedPVSpec.Name {
+					t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
+				}
+
+				if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
+					t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
+				}
+
+				if tc.expectedPVSpec.CSIPVS != nil {
+					if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
+						t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
+					}
+				}
+			}
+		}
 	}
 }
