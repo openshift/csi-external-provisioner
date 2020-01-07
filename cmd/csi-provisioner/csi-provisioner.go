@@ -30,6 +30,7 @@ import (
 
 	"github.com/kubernetes-csi/csi-lib-utils/deprecatedflags"
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
+	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	ctrl "github.com/kubernetes-csi/external-provisioner/pkg/controller"
 	snapclientset "github.com/kubernetes-csi/external-snapshotter/pkg/client/clientset/versioned"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
@@ -42,8 +43,11 @@ import (
 	"k8s.io/klog"
 
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
+	v1 "k8s.io/client-go/listers/core/v1"
+	storagelisters "k8s.io/client-go/listers/storage/v1beta1"
 	utilflag "k8s.io/component-base/cli/flag"
-	csitranslationlib "k8s.io/csi-translation-lib"
+	csitrans "k8s.io/csi-translation-lib"
 )
 
 var (
@@ -64,6 +68,9 @@ var (
 	leaderElectionType      = flag.String("leader-election-type", "endpoints", "the type of leader election, options are 'endpoints' (default) or 'leases' (strongly recommended). The 'endpoints' option is deprecated in favor of 'leases'.")
 	leaderElectionNamespace = flag.String("leader-election-namespace", "", "Namespace where the leader election resource lives. Defaults to the pod namespace if not set.")
 	strictTopology          = flag.Bool("strict-topology", false, "Passes only selected node topology to CreateVolume Request, unlike default behavior of passing aggregated cluster topologies that match with topology keys of the selected node.")
+
+	metricsAddress = flag.String("metrics-address", "", "The TCP network address address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
+	metricsPath    = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
 
 	featureGates        map[string]bool
 	provisionController *controller.ProvisionController
@@ -119,7 +126,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Failed to create client: %v", err)
 	}
-	// snapclientset.NewForConfig creates a new Clientset for VolumesnapshotV1alpha1Client
+	// snapclientset.NewForConfig creates a new Clientset for VolumesnapshotV1beta1Client
 	snapClient, err := snapclientset.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("Failed to create snapshot client: %v", err)
@@ -132,7 +139,9 @@ func main() {
 		klog.Fatalf("Error getting server version: %v", err)
 	}
 
-	grpcClient, err := ctrl.Connect(*csiEndpoint)
+	metricsManager := metrics.NewCSIMetricsManager("" /* driverName */)
+
+	grpcClient, err := ctrl.Connect(*csiEndpoint, metricsManager)
 	if err != nil {
 		klog.Error(err.Error())
 		os.Exit(1)
@@ -150,6 +159,8 @@ func main() {
 		klog.Fatalf("Error getting CSI driver name: %s", err)
 	}
 	klog.V(2).Infof("Detected CSI driver %s", provisionerName)
+	metricsManager.SetDriverName(provisionerName)
+	metricsManager.StartMetricsEndpoint(*metricsAddress, *metricsPath)
 
 	pluginCapabilities, controllerCapabilities, err := ctrl.GetDriverCapabilities(grpcClient, *operationTimeout)
 	if err != nil {
@@ -169,9 +180,11 @@ func main() {
 		controller.CreateProvisionedPVLimiter(workqueue.DefaultControllerRateLimiter()),
 	}
 
+	translator := csitrans.New()
+
 	supportsMigrationFromInTreePluginName := ""
-	if csitranslationlib.IsMigratedCSIDriverByName(provisionerName) {
-		supportsMigrationFromInTreePluginName, err = csitranslationlib.GetInTreeNameFromCSIName(provisionerName)
+	if translator.IsMigratedCSIDriverByName(provisionerName) {
+		supportsMigrationFromInTreePluginName, err = translator.GetInTreeNameFromCSIName(provisionerName)
 		if err != nil {
 			klog.Fatalf("Failed to get InTree plugin name for migrated CSI plugin %s: %v", provisionerName, err)
 		}
@@ -179,9 +192,35 @@ func main() {
 		provisionerOptions = append(provisionerOptions, controller.AdditionalProvisionerNames([]string{supportsMigrationFromInTreePluginName}))
 	}
 
+	var csiNodeLister storagelisters.CSINodeLister
+	var nodeLister v1.NodeLister
+	var factory informers.SharedInformerFactory
+	if ctrl.SupportsTopology(pluginCapabilities) {
+		// Create informer to prevent hit the API server for all resource request
+		factory = informers.NewSharedInformerFactory(clientset, ctrl.ResyncPeriodOfCsiNodeInformer)
+		csiNodeLister = factory.Storage().V1beta1().CSINodes().Lister()
+		nodeLister = factory.Core().V1().Nodes().Lister()
+	}
+
 	// Create the provisioner: it implements the Provisioner interface expected by
 	// the controller
-	csiProvisioner := ctrl.NewCSIProvisioner(clientset, *operationTimeout, identity, *volumeNamePrefix, *volumeNameUUIDLength, grpcClient, snapClient, provisionerName, pluginCapabilities, controllerCapabilities, supportsMigrationFromInTreePluginName, *strictTopology)
+	csiProvisioner := ctrl.NewCSIProvisioner(
+		clientset,
+		*operationTimeout,
+		identity,
+		*volumeNamePrefix,
+		*volumeNameUUIDLength,
+		grpcClient,
+		snapClient,
+		provisionerName,
+		pluginCapabilities,
+		controllerCapabilities,
+		supportsMigrationFromInTreePluginName,
+		*strictTopology,
+		translator,
+		csiNodeLister,
+		nodeLister)
+
 	provisionController = controller.NewProvisionController(
 		clientset,
 		provisionerName,
@@ -191,6 +230,17 @@ func main() {
 	)
 
 	run := func(context.Context) {
+		if factory != nil {
+			stopCh := context.Background().Done()
+			factory.Start(stopCh)
+			cacheSyncResult := factory.WaitForCacheSync(stopCh)
+			for _, v := range cacheSyncResult {
+				if !v {
+					klog.Fatalf("Failed to sync Informers!")
+				}
+			}
+		}
+
 		provisionController.Run(wait.NeverStop)
 	}
 
