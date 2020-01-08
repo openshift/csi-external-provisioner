@@ -30,25 +30,27 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
-	"github.com/kubernetes-csi/external-provisioner/pkg/features"
-	snapapi "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1alpha1"
+	"github.com/kubernetes-csi/csi-lib-utils/metrics"
+	"github.com/kubernetes-csi/csi-lib-utils/rpc"
+	snapapi "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1beta1"
 	snapclientset "github.com/kubernetes-csi/external-snapshotter/pkg/client/clientset/versioned"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/util"
 
 	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	_ "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	csitranslationlib "k8s.io/csi-translation-lib"
 	"k8s.io/klog"
 
 	"google.golang.org/grpc"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	storagelisters "k8s.io/client-go/listers/storage/v1beta1"
 )
 
 //secretParamsMap provides a mapping of current as well as deprecated secret keys
@@ -115,9 +117,13 @@ const (
 	tokenPVCNameKey      = "pvc.name"
 	tokenPVCNameSpaceKey = "pvc.namespace"
 
+	ResyncPeriodOfCsiNodeInformer = 1 * time.Hour
+
 	deleteVolumeRetryCount = 5
 
 	annStorageProvisioner = "volume.beta.kubernetes.io/storage-provisioner"
+
+	snapshotNotBound = "snapshot %s not bound"
 )
 
 var (
@@ -160,6 +166,18 @@ var (
 	}
 )
 
+// ProvisionerCSITranslator contains the set of CSI Translation functionality
+// required by the provisioner
+type ProvisionerCSITranslator interface {
+	TranslateInTreeStorageClassToCSI(inTreePluginName string, sc *storagev1.StorageClass) (*storagev1.StorageClass, error)
+	TranslateCSIPVToInTree(pv *v1.PersistentVolume) (*v1.PersistentVolume, error)
+	IsPVMigratable(pv *v1.PersistentVolume) bool
+	TranslateInTreePVToCSI(pv *v1.PersistentVolume) (*v1.PersistentVolume, error)
+
+	IsMigratedCSIDriverByName(csiPluginName string) bool
+	GetInTreeNameFromCSIName(pluginName string) (string, error)
+}
+
 // requiredCapabilities provides a set of extra capabilities required for special/optional features provided by a plugin
 type requiredCapabilities struct {
 	snapshot bool
@@ -178,10 +196,13 @@ type csiProvisioner struct {
 	volumeNameUUIDLength                  int
 	config                                *rest.Config
 	driverName                            string
-	pluginCapabilities                    connection.PluginCapabilitySet
-	controllerCapabilities                connection.ControllerCapabilitySet
+	pluginCapabilities                    rpc.PluginCapabilitySet
+	controllerCapabilities                rpc.ControllerCapabilitySet
 	supportsMigrationFromInTreePluginName string
 	strictTopology                        bool
+	translator                            ProvisionerCSITranslator
+	csiNodeLister                         storagelisters.CSINodeLister
+	nodeLister                            corelisters.NodeLister
 }
 
 var _ controller.Provisioner = &csiProvisioner{}
@@ -195,24 +216,24 @@ var (
 	provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
 )
 
-func Connect(address string) (*grpc.ClientConn, error) {
-	return connection.Connect(address, connection.OnConnectionLoss(connection.ExitOnConnectionLoss()))
+func Connect(address string, metricsManager metrics.CSIMetricsManager) (*grpc.ClientConn, error) {
+	return connection.Connect(address, metricsManager, connection.OnConnectionLoss(connection.ExitOnConnectionLoss()))
 }
 
 func Probe(conn *grpc.ClientConn, singleCallTimeout time.Duration) error {
-	return connection.ProbeForever(conn, singleCallTimeout)
+	return rpc.ProbeForever(conn, singleCallTimeout)
 }
 
 func GetDriverName(conn *grpc.ClientConn, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return connection.GetDriverName(ctx, conn)
+	return rpc.GetDriverName(ctx, conn)
 }
 
-func GetDriverCapabilities(conn *grpc.ClientConn, timeout time.Duration) (connection.PluginCapabilitySet, connection.ControllerCapabilitySet, error) {
+func GetDriverCapabilities(conn *grpc.ClientConn, timeout time.Duration) (rpc.PluginCapabilitySet, rpc.ControllerCapabilitySet, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	pluginCapabilities, err := connection.GetPluginCapabilities(ctx, conn)
+	pluginCapabilities, err := rpc.GetPluginCapabilities(ctx, conn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -220,7 +241,7 @@ func GetDriverCapabilities(conn *grpc.ClientConn, timeout time.Duration) (connec
 	/* Each CSI operation gets its own timeout / context */
 	ctx, cancel = context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	controllerCapabilities, err := connection.GetControllerCapabilities(ctx, conn)
+	controllerCapabilities, err := rpc.GetControllerCapabilities(ctx, conn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -237,10 +258,13 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	grpcClient *grpc.ClientConn,
 	snapshotClient snapclientset.Interface,
 	driverName string,
-	pluginCapabilities connection.PluginCapabilitySet,
-	controllerCapabilities connection.ControllerCapabilitySet,
+	pluginCapabilities rpc.PluginCapabilitySet,
+	controllerCapabilities rpc.ControllerCapabilitySet,
 	supportsMigrationFromInTreePluginName string,
-	strictTopology bool) controller.Provisioner {
+	strictTopology bool,
+	translator ProvisionerCSITranslator,
+	csiNodeLister storagelisters.CSINodeLister,
+	nodeLister corelisters.NodeLister) controller.Provisioner {
 
 	csiClient := csi.NewControllerClient(grpcClient)
 	provisioner := &csiProvisioner{
@@ -257,6 +281,9 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		controllerCapabilities:                controllerCapabilities,
 		supportsMigrationFromInTreePluginName: supportsMigrationFromInTreePluginName,
 		strictTopology:                        strictTopology,
+		translator:                            translator,
+		csiNodeLister:                         csiNodeLister,
+		nodeLister:                            nodeLister,
 	}
 	return provisioner
 }
@@ -388,7 +415,7 @@ func (p *csiProvisioner) ProvisionExt(options controller.ProvisionOptions) (*v1.
 		// so that external provisioner can correctly pick up the PVC pointing to an in-tree plugin
 		if options.StorageClass.Provisioner == p.supportsMigrationFromInTreePluginName {
 			klog.V(2).Infof("translating storage class for in-tree plugin %s to CSI", options.StorageClass.Provisioner)
-			storageClass, err := csitranslationlib.TranslateInTreeStorageClassToCSI(p.supportsMigrationFromInTreePluginName, options.StorageClass)
+			storageClass, err := p.translator.TranslateInTreeStorageClassToCSI(p.supportsMigrationFromInTreePluginName, options.StorageClass)
 			if err != nil {
 				return nil, controller.ProvisioningFinished, fmt.Errorf("failed to translate storage class: %v", err)
 			}
@@ -484,7 +511,9 @@ func (p *csiProvisioner) ProvisionExt(options controller.ProvisionOptions) (*v1.
 			options.PVC.Name,
 			options.StorageClass.AllowedTopologies,
 			options.SelectedNode,
-			p.strictTopology)
+			p.strictTopology,
+			p.csiNodeLister,
+			p.nodeLister)
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, fmt.Errorf("error generating accessibility requirements: %v", err)
 		}
@@ -631,7 +660,7 @@ func (p *csiProvisioner) ProvisionExt(options controller.ProvisionOptions) (*v1.
 	klog.V(2).Infof("successfully created PV %v for PVC %v and csi volume name %v", pv.Name, options.PVC.Name, pv.Spec.CSI.VolumeHandle)
 
 	if migratedVolume {
-		pv, err = csitranslationlib.TranslateCSIPVToInTree(pv)
+		pv, err = p.translator.TranslateCSIPVToInTree(pv)
 		if err != nil {
 			klog.Warningf("failed to translate CSI PV to in-tree due to: %v. Deleting provisioned PV", err)
 			deleteErr := p.Delete(pv)
@@ -649,8 +678,7 @@ func (p *csiProvisioner) ProvisionExt(options controller.ProvisionOptions) (*v1.
 }
 
 func (p *csiProvisioner) supportsTopology() bool {
-	return p.pluginCapabilities[csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS] &&
-		utilfeature.DefaultFeatureGate.Enabled(features.Topology)
+	return SupportsTopology(p.pluginCapabilities)
 }
 
 func removePrefixedParameters(param map[string]string) (map[string]string, error) {
@@ -703,7 +731,7 @@ func (p *csiProvisioner) getVolumeContentSource(options controller.ProvisionOpti
 func (p *csiProvisioner) getPVCSource(options controller.ProvisionOptions) (*csi.VolumeContentSource, error) {
 	sourcePVC, err := p.client.CoreV1().PersistentVolumeClaims(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("error getting PVC %s from api server: %v", options.PVC.Spec.DataSource.Name, err)
+		return nil, fmt.Errorf("error getting PVC %s (namespace %q) from api server: %v", options.PVC.Spec.DataSource.Name, options.PVC.Namespace, err)
 	}
 	if string(sourcePVC.Status.Phase) != "Bound" {
 		return nil, fmt.Errorf("the PVC DataSource %s must have a status of Bound.  Got %v", options.PVC.Spec.DataSource.Name, sourcePVC.Status)
@@ -776,12 +804,9 @@ func (p *csiProvisioner) getPVCSource(options controller.ProvisionOptions) (*csi
 // getSnapshotSource verifies DataSource.Kind of type VolumeSnapshot, making sure that the requested Snapshot is available/ready
 // returns the VolumeContentSource for the requested snapshot
 func (p *csiProvisioner) getSnapshotSource(options controller.ProvisionOptions) (*csi.VolumeContentSource, error) {
-	snapshotObj, err := p.snapshotClient.VolumesnapshotV1alpha1().VolumeSnapshots(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
+	snapshotObj, err := p.snapshotClient.SnapshotV1beta1().VolumeSnapshots(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error getting snapshot %s from api server: %v", options.PVC.Spec.DataSource.Name, err)
-	}
-	if snapshotObj.Status.ReadyToUse == false {
-		return nil, fmt.Errorf("snapshot %s is not Ready", options.PVC.Spec.DataSource.Name)
 	}
 
 	if snapshotObj.ObjectMeta.DeletionTimestamp != nil {
@@ -789,36 +814,40 @@ func (p *csiProvisioner) getSnapshotSource(options controller.ProvisionOptions) 
 	}
 	klog.V(5).Infof("VolumeSnapshot %+v", snapshotObj)
 
-	snapContentObj, err := p.snapshotClient.VolumesnapshotV1alpha1().VolumeSnapshotContents().Get(snapshotObj.Spec.SnapshotContentName, metav1.GetOptions{})
-	if err != nil {
-		klog.Warningf("error getting snapshotcontent %s for snapshot %s/%s from api server: %s", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, err)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
+	if snapshotObj.Status == nil || snapshotObj.Status.BoundVolumeSnapshotContentName == nil {
+		return nil, fmt.Errorf(snapshotNotBound, options.PVC.Spec.DataSource.Name)
 	}
 
-	if snapContentObj.Spec.VolumeSnapshotRef == nil {
-		klog.Warningf("snapshotcontent %s for snapshot %s/%s is not bound", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
+	snapContentObj, err := p.snapshotClient.SnapshotV1beta1().VolumeSnapshotContents().Get(*snapshotObj.Status.BoundVolumeSnapshotContentName, metav1.GetOptions{})
+
+	if err != nil {
+		klog.Warningf("error getting snapshotcontent %s for snapshot %s/%s from api server: %s", *snapshotObj.Status.BoundVolumeSnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, err)
+		return nil, fmt.Errorf(snapshotNotBound, options.PVC.Spec.DataSource.Name)
 	}
 
 	if snapContentObj.Spec.VolumeSnapshotRef.UID != snapshotObj.UID || snapContentObj.Spec.VolumeSnapshotRef.Namespace != snapshotObj.Namespace || snapContentObj.Spec.VolumeSnapshotRef.Name != snapshotObj.Name {
-		klog.Warningf("snapshotcontent %s for snapshot %s/%s is bound to a different snapshot", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
+		klog.Warningf("snapshotcontent %s for snapshot %s/%s is bound to a different snapshot", *snapshotObj.Status.BoundVolumeSnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
+		return nil, fmt.Errorf(snapshotNotBound, options.PVC.Spec.DataSource.Name)
 	}
 
-	if snapContentObj.Spec.VolumeSnapshotSource.CSI == nil {
-		klog.Warningf("error getting snapshot source from snapshotcontent %s for snapshot %s/%s", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
+	if snapContentObj.Spec.Driver != options.StorageClass.Provisioner {
+		klog.Warningf("snapshotcontent %s for snapshot %s/%s is handled by a different CSI driver than requested by StorageClass %s", *snapshotObj.Status.BoundVolumeSnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, options.StorageClass.Name)
+		return nil, fmt.Errorf(snapshotNotBound, options.PVC.Spec.DataSource.Name)
 	}
 
-	if snapContentObj.Spec.VolumeSnapshotSource.CSI.Driver != options.StorageClass.Provisioner {
-		klog.Warningf("snapshotcontent %s for snapshot %s/%s is handled by a different CSI driver than requested by StorageClass %s", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, options.StorageClass.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
+	if snapshotObj.Status.ReadyToUse == nil || *snapshotObj.Status.ReadyToUse == false {
+		return nil, fmt.Errorf("snapshot %s is not Ready", options.PVC.Spec.DataSource.Name)
 	}
 
 	klog.V(5).Infof("VolumeSnapshotContent %+v", snapContentObj)
+
+	if snapContentObj.Status == nil || snapContentObj.Status.SnapshotHandle == nil {
+		return nil, fmt.Errorf("snapshot handle %s is not available", options.PVC.Spec.DataSource.Name)
+	}
+
 	snapshotSource := csi.VolumeContentSource_Snapshot{
 		Snapshot: &csi.VolumeContentSource_SnapshotSource{
-			SnapshotId: snapContentObj.Spec.VolumeSnapshotSource.CSI.SnapshotHandle,
+			SnapshotId: *snapContentObj.Status.SnapshotHandle,
 		},
 	}
 	klog.V(5).Infof("VolumeContentSource_Snapshot %+v", snapshotSource)
@@ -853,12 +882,12 @@ func (p *csiProvisioner) Delete(volume *v1.PersistentVolume) error {
 	}
 
 	var err error
-	if csitranslationlib.IsPVMigratable(volume) {
+	if p.translator.IsPVMigratable(volume) {
 		// we end up here only if CSI migration is enabled in-tree (both overall
 		// and for the specific plugin that is migratable) causing in-tree PV
 		// controller to yield deletion of PVs with in-tree source to external provisioner
 		// based on AnnDynamicallyProvisioned annotation.
-		volume, err = csitranslationlib.TranslateInTreePVToCSI(volume)
+		volume, err = p.translator.TranslateInTreePVToCSI(volume)
 		if err != nil {
 			return err
 		}
@@ -900,7 +929,7 @@ func (p *csiProvisioner) Delete(volume *v1.PersistentVolume) error {
 			}
 			req.Secrets = credentials
 		} else {
-			klog.Warningf("failed to get storageclass: %s, proceeding to delete without secrets", storageClassName)
+			klog.Warningf("failed to get storageclass: %s, proceeding to delete without secrets. %v", storageClassName, err)
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
