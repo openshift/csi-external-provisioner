@@ -21,14 +21,16 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"k8s.io/api/core/v1"
-	storage "k8s.io/api/storage/v1beta1"
+	v1 "k8s.io/api/core/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/listers/storage/v1beta1"
+	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
+	storagelistersv1beta1 "k8s.io/client-go/listers/storage/v1beta1"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
 )
 
@@ -393,7 +395,7 @@ func TestStatefulSetSpreading(t *testing.T) {
 
 	kubeClient := fakeclientset.NewSimpleClientset(nodes, csiNodes)
 
-	csiNodeLister, nodeLister, stopChan := listers(kubeClient)
+	_, csiNodeLister, nodeLister, _, stopChan := listers(kubeClient)
 	defer close(stopChan)
 
 	for name, tc := range testcases {
@@ -1083,7 +1085,7 @@ func TestTopologyAggregation(t *testing.T) {
 
 			kubeClient := fakeclientset.NewSimpleClientset(nodes, csiNodes)
 
-			csiNodeLister, nodeLister, stopChan := listers(kubeClient)
+			_, csiNodeLister, nodeLister, _, stopChan := listers(kubeClient)
 			defer close(stopChan)
 
 			var selectedNode *v1.Node
@@ -1321,6 +1323,73 @@ func TestPreferredTopologies(t *testing.T) {
 			},
 			expectError: true,
 		},
+		"allowedTopologies is subset of selected node's topology": {
+			allowedTopologies: []v1.TopologySelectorTerm{
+				{
+					MatchLabelExpressions: []v1.TopologySelectorLabelRequirement{
+						{
+							Key:    "com.example.csi/disk",
+							Values: []string{"ssd"},
+						},
+						{
+							Key:    "com.example.csi/zone",
+							Values: []string{"zone1"},
+						},
+					},
+				},
+			},
+			nodeLabels: []map[string]string{
+				{"com.example.csi/zone": "zone1", "com.example.csi/rack": "rack1", "com.example.csi/disk": "ssd"},
+				{"com.example.csi/zone": "zone2", "com.example.csi/rack": "rack2", "com.example.csi/disk": "ssd"},
+				{"com.example.csi/zone": "zone2", "com.example.csi/rack": "rack1", "com.example.csi/disk": "nvme"},
+			},
+			topologyKeys: []map[string][]string{
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack", "com.example.csi/disk"}},
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack", "com.example.csi/disk"}},
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack", "com.example.csi/disk"}},
+			},
+			expectError: false,
+			expectedPreferred: []*csi.Topology{
+				{
+					Segments: map[string]string{
+						"com.example.csi/disk": "ssd",
+						"com.example.csi/zone": "zone1",
+					},
+				},
+			},
+			expectedStrictPreferred: []*csi.Topology{
+				{
+					Segments: map[string]string{
+						"com.example.csi/disk": "ssd",
+						"com.example.csi/rack": "rack1",
+						"com.example.csi/zone": "zone1",
+					},
+				},
+			},
+		},
+		"allowedTopologies is not the subset of selected node's topology": {
+			allowedTopologies: []v1.TopologySelectorTerm{
+				{
+					MatchLabelExpressions: []v1.TopologySelectorLabelRequirement{
+						{
+							Key:    "com.example.csi/zone",
+							Values: []string{"zone1"},
+						},
+					},
+				},
+			},
+			nodeLabels: []map[string]string{
+				{"com.example.csi/zone": "zone10", "com.example.csi/rack": "rack1"},
+				{"com.example.csi/zone": "zone11", "com.example.csi/rack": "rack2"},
+				{"com.example.csi/zone": "zone12", "com.example.csi/rack": "rack1"},
+			},
+			topologyKeys: []map[string][]string{
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+				{testDriverName: []string{"com.example.csi/zone", "com.example.csi/rack"}},
+			},
+			expectError: true,
+		},
 	}
 
 	for name, tc := range testcases {
@@ -1336,7 +1405,7 @@ func TestPreferredTopologies(t *testing.T) {
 			kubeClient := fakeclientset.NewSimpleClientset(nodes, csiNodes)
 			selectedNode := &nodes.Items[0]
 
-			csiNodeLister, nodeLister, stopChan := listers(kubeClient)
+			_, csiNodeLister, nodeLister, _, stopChan := listers(kubeClient)
 			defer close(stopChan)
 
 			requirements, err := GenerateAccessibilityRequirements(
@@ -1404,19 +1473,19 @@ func buildNodes(nodeLabels []map[string]string, nodeVersion string) *v1.NodeList
 	return list
 }
 
-func buildCSINodes(csiNodes []map[string][]string) *storage.CSINodeList {
-	list := &storage.CSINodeList{}
+func buildCSINodes(csiNodes []map[string][]string) *storagev1beta1.CSINodeList {
+	list := &storagev1beta1.CSINodeList{}
 	i := 0
 	for _, csiNode := range csiNodes {
 		nodeName := fmt.Sprintf("node-%d", i)
-		n := storage.CSINode{
+		n := storagev1beta1.CSINode{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: nodeName,
 			},
 		}
-		var csiDrivers []storage.CSINodeDriver
+		var csiDrivers []storagev1beta1.CSINodeDriver
 		for driver, topologyKeys := range csiNode {
-			driverInfos := []storage.CSINodeDriver{
+			driverInfos := []storagev1beta1.CSINodeDriver{
 				{
 					Name:         driver,
 					NodeID:       nodeName,
@@ -1430,7 +1499,7 @@ func buildCSINodes(csiNodes []map[string][]string) *storage.CSINodeList {
 			}
 			csiDrivers = append(csiDrivers, driverInfos...)
 		}
-		n.Spec = storage.CSINodeSpec{Drivers: csiDrivers}
+		n.Spec = storagev1beta1.CSINodeSpec{Drivers: csiDrivers}
 		list.Items = append(list.Items, n)
 		i++
 	}
@@ -1550,12 +1619,19 @@ func requisiteEqual(t1, t2 []*csi.Topology) bool {
 	return unchecked.Len() == 0
 }
 
-func listers(kubeClient *fakeclientset.Clientset) (v1beta1.CSINodeLister, corelisters.NodeLister, chan struct{}) {
+func listers(kubeClient *fakeclientset.Clientset) (
+	storagelistersv1.StorageClassLister,
+	storagelistersv1beta1.CSINodeLister,
+	corelisters.NodeLister,
+	corelisters.PersistentVolumeClaimLister,
+	chan struct{}) {
 	factory := informers.NewSharedInformerFactory(kubeClient, ResyncPeriodOfCsiNodeInformer)
 	stopChan := make(chan struct{})
+	scLister := factory.Storage().V1().StorageClasses().Lister()
 	csiNodeLister := factory.Storage().V1beta1().CSINodes().Lister()
 	nodeLister := factory.Core().V1().Nodes().Lister()
+	claimLister := factory.Core().V1().PersistentVolumeClaims().Lister()
 	factory.Start(stopChan)
 	factory.WaitForCacheSync(stopChan)
-	return csiNodeLister, nodeLister, stopChan
+	return scLister, csiNodeLister, nodeLister, claimLister, stopChan
 }
