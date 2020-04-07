@@ -13,7 +13,7 @@ This information reflects the head of this branch.
 
 | Compatible with CSI Version                                                                | Container Image                | Recommended K8s Version |
 | ------------------------------------------------------------------------------------------ | -------------------------------| --------------- |
-| [CSI Spec v1.0.0](https://github.com/container-storage-interface/spec/releases/tag/v1.0.0) | quay.io/k8scsi/csi-provisioner | 1.17            |
+| [CSI Spec v1.0.0](https://github.com/container-storage-interface/spec/releases/tag/v1.0.0) | quay.io/k8scsi/csi-provisioner | 1.18            |
 
 ## Feature status
 
@@ -23,8 +23,6 @@ Following table reflects the head of this branch.
 
 | Feature        | Status  | Default | Description                                                                                   | Provisioner Feature Gate Required |
 | -------------- | ------- | ------- | --------------------------------------------------------------------------------------------- | --------------------------------- |
-| Topology       | Beta    | Off     | [Topology aware dynamic provisioning](https://kubernetes-csi.github.io/docs/topology.html)  (requires kubelet 1.14 on nodes). | Yes |
-| Cloning        | Beta    | On      | [Cloning](https://kubernetes-csi.github.io/docs/volume-cloning.html). | No |
 | Snapshots      | Beta    | On      | [Snapshots and Restore](https://kubernetes-csi.github.io/docs/snapshot-restore-feature.html). | No |
 | CSIMigration   | Beta    | On      | [Migrating in-tree volume plugins to CSI](https://kubernetes.io/docs/concepts/storage/volumes/#csi-migration). | No |
 
@@ -61,9 +59,13 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 
 * `--worker-threads <num>`: Number of simultaneously running `ControllerCreateVolume` and `ControllerDeleteVolume` operations. Default value is `100`.
 
-* `--metrics-address`: The TCP network address address where the prometheus metrics endpoint will run (example: `:8080` which corresponds to port 8080 on local host). The default is empty string, which means metrics endpoint is disabled.
+* `--cloning-protection-threads <num>`: Number of simultaniously running threads, handling cloning finalizer removal. Defaults to `1`.
+
+* `--metrics-address`: The TCP network address where the prometheus metrics endpoint will run (example: `:8080` which corresponds to port 8080 on local host). The default is empty string, which means metrics endpoint is disabled.
 
 * `--metrics-path`: The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.
+
+* `--extra-create-metadata`: Enables the injection of extra PVC and PV metadata as parameters when calling `CreateVolume` on the driver (keys: "csi.storage.k8s.io/pvc/name", "csi.storage.k8s.io/pvc/namespace", "csi.storage.k8s.io/pv/name")
 
 #### Other recognized arguments
 * `--feature-gates <gates>`: A set of comma separated `<feature-name>=<true|false>` pairs that describe feature gates for alpha/experimental features. See [list of features](#feature-status) or `--help` output for list of recognized features. Example: `--feature-gates Topology=true` to enable Topology feature that's disabled by default.
