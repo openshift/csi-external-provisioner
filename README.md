@@ -11,9 +11,9 @@ The external-provisioner is an external controller that monitors `PersistentVolu
 
 This information reflects the head of this branch.
 
-| Compatible with CSI Version                                                                | Container Image                | Recommended K8s Version |
-| ------------------------------------------------------------------------------------------ | -------------------------------| --------------- |
-| [CSI Spec v1.0.0](https://github.com/container-storage-interface/spec/releases/tag/v1.0.0) | quay.io/k8scsi/csi-provisioner | 1.18            |
+| Compatible with CSI Version | Container Image | [Min K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#minimum-version) | [Recommended K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#recommended-version) |
+| ------------------------------------------------------------------------------------------ | -------------------------------| --------------- | ------------- |
+| [CSI Spec v1.0.0](https://github.com/container-storage-interface/spec/releases/tag/v1.0.0) | k8s.gcr.io/sig-storage/csi-provisioner | 1.17 | 1.19 |
 
 ## Feature status
 
@@ -25,6 +25,7 @@ Following table reflects the head of this branch.
 | -------------- | ------- | ------- | --------------------------------------------------------------------------------------------- | --------------------------------- |
 | Snapshots      | Beta    | On      | [Snapshots and Restore](https://kubernetes-csi.github.io/docs/snapshot-restore-feature.html). | No |
 | CSIMigration   | Beta    | On      | [Migrating in-tree volume plugins to CSI](https://kubernetes.io/docs/concepts/storage/volumes/#csi-migration). | No |
+| CSIStorageCapacity | Alpha | Off | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler. | No |
 
 All other external-provisioner features and the external-provisioner itself is considered GA and fully supported.
 
@@ -45,9 +46,7 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 #### Recommended optional arguments
 * `--csi-address <path to CSI socket>`: This is the path to the CSI driver socket inside the pod that the external-provisioner container will use to issue CSI operations (`/run/csi/socket` is used by default).
 
-* `--enable-leader-election`: Enables leader election. This is mandatory when there are multiple replicas of the same external-provisioner running for one CSI driver. Only one of them may be active (=leader). A new leader will be re-elected when current leader dies or becomes unresponsive for ~15 seconds.
-
-* `--leader-election-type`: The resource type to use for leader election, options are 'endpoints' (default) or 'leases' (recommended)
+* `--leader-election`: Enables leader election. This is mandatory when there are multiple replicas of the same external-provisioner running for one CSI driver. Only one of them may be active (=leader). A new leader will be re-elected when current leader dies or becomes unresponsive for ~15 seconds.
 
 * `--leader-election-namespace`: Namespace where leader election object will be created. It is recommended that this parameter is populated from Kubernetes DownwardAPI with the namespace where the external-provisioner runs in.
 
@@ -59,13 +58,31 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 
 * `--worker-threads <num>`: Number of simultaneously running `ControllerCreateVolume` and `ControllerDeleteVolume` operations. Default value is `100`.
 
-* `--cloning-protection-threads <num>`: Number of simultaniously running threads, handling cloning finalizer removal. Defaults to `1`.
+* `--kube-api-qps <num>`: QPS for clients that communicate with the kubernetes apiserver. Defaults to `5.0`.
+
+* `--kube-api-burst <num>`: Burst for clients that communicate with the kubernetes apiserver. Defaults to `10`.
+
+* `--cloning-protection-threads <num>`: Number of simultaneously running threads, handling cloning finalizer removal. Defaults to `1`.
 
 * `--metrics-address`: The TCP network address where the prometheus metrics endpoint will run (example: `:8080` which corresponds to port 8080 on local host). The default is empty string, which means metrics endpoint is disabled.
 
 * `--metrics-path`: The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.
 
 * `--extra-create-metadata`: Enables the injection of extra PVC and PV metadata as parameters when calling `CreateVolume` on the driver (keys: "csi.storage.k8s.io/pvc/name", "csi.storage.k8s.io/pvc/namespace", "csi.storage.k8s.io/pv/name")
+
+##### Storage capacity arguments
+
+See the [storage capacity section](#capacity-support) below for details.
+
+* `--capacity-controller-deployment-mode=central`: Setting this enables producing CSIStorageCapacity objects with capacity information from the driver's GetCapacity call. 'central' is currently the only supported mode. Use it when there is just one active provisioner in the cluster. The default is to not produce CSIStorageCapacity objects.
+
+* `--capacity-ownerref-level <levels>`: The level indicates the number of objects that need to be traversed starting from the pod identified by the POD_NAME and POD_NAMESPACE environment variables to reach the owning object for CSIStorageCapacity objects: 0 for the pod itself, 1 for a StatefulSet, 2 for a Deployment, etc. Defaults to `1` (= StatefulSet).
+
+* `--capacity-threads <num>`: Number of simultaneously running threads, handling CSIStorageCapacity objects. Defaults to `1`.
+
+* `--capacity-poll-interval <interval>`: How long the external-provisioner waits before checking for storage capacity changes. Defaults to `1m`.
+
+* `--capacity-for-immediate-binding <bool>`: Enables producing capacity information for storage classes with immediate binding. Not needed for the Kubernetes scheduler, maybe useful for other consumers or for debugging. Defaults to `false`.
 
 #### Other recognized arguments
 * `--feature-gates <gates>`: A set of comma separated `<feature-name>=<true|false>` pairs that describe feature gates for alpha/experimental features. See [list of features](#feature-status) or `--help` output for list of recognized features. Example: `--feature-gates Topology=true` to enable Topology feature that's disabled by default.
@@ -84,13 +101,6 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 
 * All glog / klog arguments are supported, such as `-v <log level>` or `-alsologtostderr`.
 
-#### Deprecated arguments
-* `--connection-timeout <duration>`: This option was used to limit establishing connection to CSI driver. Currently, the option does not have any effect and the external-provisioner tries to connect to CSI driver socket indefinitely. It is recommended to run ReadinessProbe on the driver to ensure that the driver comes up in reasonable time.
-
-* `--provisioner`: This option was used to set a provisioner name to look for in the StorageClass. Currently, the option does not have any effect and the external-provisioner uses the CSI driver name.
-
-* `--leader-election-type`: This option was used to choose which leader election resource type to use. Currently, the option defaults to `endpoints`, but will be removed in the future to only support `Lease` based leader election.
-
 ### Topology support
 When `Topology` feature is enabled and the driver specifies `VOLUME_ACCESSIBILITY_CONSTRAINTS` in its plugin capabilities, external-provisioner prepares `CreateVolumeRequest.AccessibilityRequirements` while calling `Controller.CreateVolume`. The driver has to consider these topology constraints while creating the volume. Below table shows how these `AccessibilityRequirements` are prepared:
 
@@ -101,6 +111,109 @@ Yes | No  | No | `Requisite` = Aggregated cluster topology<br>`Preferred` = `Req
 Yes | No | Yes | `Requisite` = Allowed topologies<br>`Preferred` = `Requisite` with selected node topology as first element
 No | Irrelevant | No | `Requisite` = Aggregated cluster topology<br>`Preferred` = `Requisite` with randomly selected node topology as first element
 No | Irrelevant | Yes | `Requisite` = Allowed topologies<br>`Preferred` = `Requisite` with randomly selected node topology as first element
+
+### Capacity support
+
+> :warning: *Warning:* This is an alpha feature and only supported by
+> Kubernetes >= 1.19 if the `CSIStorageCapacity` feature gate is
+> enabled.
+
+The external-provisioner can be used to create CSIStorageCapacity
+objects that hold information about the storage capacity available
+through the driver. The Kubernetes scheduler then [uses that
+information](https://kubernetes.io/docs/concepts/storage/storage-capacity]
+when selecting nodes for pods with unbound volumes that wait for the
+first consumer.
+
+Currently, all CSIStorageCapacity objects created by an instance of
+the external-provisioner must have the same
+[owner](https://kubernetes.io/docs/concepts/workloads/controllers/garbage-collection/#owners-and-dependents). That
+owner is how external-provisioner distinguishes between objects that
+it must manage and those that it must leave alone. The owner is
+determine with the `POD_NAME/POD_NAMESPACE` environment variables and
+the `--capacity-ownerref-level` parameter. Other solutions will be
+added in the future.
+
+To enable this feature in a driver deployment (see also the
+[`deploy/kubernetes/storage-capacity.yaml`](deploy/kubernetes/storage-capacity.yaml)
+example):
+
+- Set the `POD_NAME` and `POD_NAMESPACE` environment variables like this:
+```yaml
+   env:
+   - name: POD_NAMESPACE
+     valueFrom:
+        fieldRef:
+        fieldPath: metadata.namespace
+   - name: POD_NAME
+     valueFrom:
+        fieldRef:
+        fieldPath: metadata.name
+```
+- Add `--enable-capacity=central` to the command line flags.
+- Add `StorageCapacity: true` to the CSIDriver information object.
+  Without it, external-provisioner will publish information, but the
+  Kubernetes scheduler will ignore it. This can be used to first
+  deploy the driver without that flag, then when sufficient
+  information has been published, enabled the scheduler usage of it.
+- If external-provisioner is not deployed with a StatefulSet, then
+  configure with `--capacity-ownerref-level` which object is meant to own
+  CSIStorageCapacity objects.
+- Optional: configure how often external-provisioner polls the driver
+  to detect changed capacity with `--capacity-poll-interval`.
+- Optional: configure how many worker threads are used in parallel
+  with `--capacity-threads`.
+- Optional: enable producing information also for storage classes that
+  use immediate volume binding with
+  `--enable-capacity=immediate-binding`. This is usually not needed
+  because such volumes are created by the driver without involving the
+  Kubernetes scheduler and thus the published information would just
+  be ignored.
+
+To determine how many different topology segments exist,
+external-provisioner uses the topology keys and labels that the CSI
+driver instance on each node reports to kubelet in the
+`NodeGetInfoResponse.accessible_topology` field. The keys are stored
+by kubelet in the CSINode objects and the actual values in Node
+annotations.
+
+CSI drivers must report topology information that matches the storage
+pool(s) that it has access to, with granularity that matches the most
+restrictive pool.
+
+For example, if the driver runs in a node with region/rack topology
+and has access to per-region storage as well as per-rack storage, then
+the driver should report topology with region/rack as its keys. If it
+only has access to per-region storage, then it should just use region
+as key. If it uses region/rack, then redundant CSIStorageCapacity
+objects will be published, but the information is still correct. See
+the
+[KEP](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/1472-storage-capacity-tracking#with-central-controller)
+for details.
+
+For each segment and each storage class, CSI `GetCapacity` is called
+once with the topology of the segment and the parameters of the
+class. If there is no error and the capacity is non-zero, a
+CSIStorageCapacity object is created or updated (if it
+already exists from a prior call) with that information. Obsolete
+objects are removed.
+
+To ensure that CSIStorageCapacity objects get removed when the
+external-provisioner gets removed from the cluster, they all have an
+owner and therefore get garbage-collected when that owner
+disappears. The owner is not the external-provisioner pod itself but
+rather one of its parents as specified by `--capacity-ownerref-level`.
+This way, it is possible to switch between external-provisioner
+instances without losing the already gathered information.
+
+CSIStorageCapacity objects are namespaced and get created in the
+namespace of the external-provisioner. Only CSIStorageCapacity objects
+with the right owner are modified by external-provisioner and their
+name is generated, so it is possible to deploy different drivers in
+the same namespace. However, Kubernetes does not check who is creating
+CSIStorageCapacity objects, so in theory a malfunctioning or malicious
+driver deployment could also publish incorrect information about some
+other driver.
 
 ### CSI error and timeout handling
 The external-provisioner invokes all gRPC calls to CSI driver with timeout provided by `--timeout` command line argument (15 seconds by default).
