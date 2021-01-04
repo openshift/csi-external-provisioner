@@ -35,7 +35,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
-	"k8s.io/klog"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/klog/v2"
 )
 
 // topologyTerm represents a single term where its topology key value pairs are AND'd together.
@@ -70,6 +71,26 @@ func GenerateVolumeNodeAffinity(accessibleTopology []*csi.Topology) *v1.VolumeNo
 			NodeSelectorTerms: terms,
 		},
 	}
+}
+
+// VolumeIsAccessible checks whether the generated volume affinity is satisfied by
+// a the node topology that a CSI driver reported in GetNodeInfoResponse.
+func VolumeIsAccessible(affinity *v1.VolumeNodeAffinity, nodeTopology *csi.Topology) (bool, error) {
+	if nodeTopology == nil || affinity == nil || affinity.Required == nil {
+		// No topology information -> all volumes accessible.
+		return true, nil
+	}
+
+	nodeLabels := labels.Set{}
+	for k, v := range nodeTopology.Segments {
+		nodeLabels[k] = v
+	}
+	node := v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: nodeLabels,
+		},
+	}
+	return corev1helpers.MatchNodeSelectorTerms(&node, affinity.Required)
 }
 
 // SupportsTopology returns whether topology is supported both for plugin and external provisioner
@@ -119,6 +140,7 @@ func GenerateAccessibilityRequirements(
 	allowedTopologies []v1.TopologySelectorTerm,
 	selectedNode *v1.Node,
 	strictTopology bool,
+	immediateTopology bool,
 	csiNodeLister storagelistersv1.CSINodeLister,
 	nodeLister corelisters.NodeLister) (*csi.TopologyRequirement, error) {
 	requirement := &csi.TopologyRequirement{}
@@ -181,6 +203,13 @@ func GenerateAccessibilityRequirements(
 			// Distribute out one of the OR layers in allowedTopologies
 			requisiteTerms = flatten(allowedTopologies)
 		} else {
+			if selectedNode == nil && !immediateTopology {
+				// Don't specify any topology requirements because neither the PVC nor
+				// the storage class have limitations and the CSI driver is not interested
+				// in being told where it runs (perhaps it already knows, for example).
+				return nil, nil
+			}
+
 			// Aggregate existing topologies in nodes across the entire cluster.
 			requisiteTerms, err = aggregateTopologies(kubeClient, driverName, selectedCSINode, csiNodeLister, nodeLister)
 			if err != nil {
