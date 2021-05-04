@@ -33,7 +33,6 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/internal/grpcutil"
-	imetadata "google.golang.org/grpc/internal/metadata"
 	"google.golang.org/grpc/internal/transport/networktype"
 
 	"google.golang.org/grpc/codes"
@@ -61,7 +60,7 @@ type http2Client struct {
 	cancel     context.CancelFunc
 	ctxDone    <-chan struct{} // Cache the ctx.Done() chan.
 	userAgent  string
-	md         metadata.MD
+	md         interface{}
 	conn       net.Conn // underlying communication channel
 	loopy      *loopyWriter
 	remoteAddr net.Addr
@@ -140,26 +139,17 @@ type http2Client struct {
 }
 
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr resolver.Address, useProxy bool, grpcUA string) (net.Conn, error) {
-	address := addr.Addr
-	networkType, ok := networktype.Get(addr)
 	if fn != nil {
-		if networkType == "unix" && !strings.HasPrefix(address, "\x00") {
-			// For backward compatibility, if the user dialed "unix:///path",
-			// the passthrough resolver would be used and the user's custom
-			// dialer would see "unix:///path". Since the unix resolver is used
-			// and the address is now "/path", prepend "unix://" so the user's
-			// custom dialer sees the same address.
-			return fn(ctx, "unix://"+address)
-		}
-		return fn(ctx, address)
+		return fn(ctx, addr.Addr)
 	}
-	if !ok {
-		networkType, address = parseDialTarget(address)
+	networkType := "tcp"
+	if n, ok := networktype.Get(addr); ok {
+		networkType = n
 	}
 	if networkType == "tcp" && useProxy {
-		return proxyDial(ctx, address, grpcUA)
+		return proxyDial(ctx, addr.Addr, grpcUA)
 	}
-	return (&net.Dialer{}).DialContext(ctx, networkType, address)
+	return (&net.Dialer{}).DialContext(ctx, networkType, addr.Addr)
 }
 
 func isTemporary(err error) bool {
@@ -278,6 +268,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		ctxDone:               ctx.Done(), // Cache Done chan.
 		cancel:                cancel,
 		userAgent:             opts.UserAgent,
+		md:                    addr.Metadata,
 		conn:                  conn,
 		remoteAddr:            conn.RemoteAddr(),
 		localAddr:             conn.LocalAddr(),
@@ -304,12 +295,6 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		onClose:               onClose,
 		keepaliveEnabled:      keepaliveEnabled,
 		bufferPool:            newBufferPool(),
-	}
-
-	if md, ok := addr.Metadata.(*metadata.MD); ok {
-		t.md = *md
-	} else if md := imetadata.Get(addr); md != nil {
-		t.md = md
 	}
 	t.controlBuf = newControlBuffer(t.ctxDone)
 	if opts.InitialWindowSize >= defaultWindowSize {
@@ -527,12 +512,14 @@ func (t *http2Client) createHeaderFields(ctx context.Context, callHdr *CallHdr) 
 			}
 		}
 	}
-	for k, vv := range t.md {
-		if isReservedHeader(k) {
-			continue
-		}
-		for _, v := range vv {
-			headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, v)})
+	if md, ok := t.md.(*metadata.MD); ok {
+		for k, vv := range *md {
+			if isReservedHeader(k) {
+				continue
+			}
+			for _, v := range vv {
+				headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, v)})
+			}
 		}
 	}
 	return headerFields, nil

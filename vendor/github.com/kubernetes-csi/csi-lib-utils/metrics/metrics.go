@@ -47,9 +47,6 @@ const (
 	labelGrpcStatusCode   = "grpc_status_code"
 	unknownCSIDriverName  = "unknown-driver"
 
-	// LabelMigrated is the Label that indicate whether this is a CSI migration operation
-	LabelMigrated = "migrated"
-
 	// CSI Operation Latency with status code total - Histogram Metric
 	operationsLatencyMetricName = "operations_seconds"
 	operationsLatencyHelp       = "Container Storage Interface operation duration with gRPC error code status total"
@@ -85,10 +82,6 @@ type CSIMetricsManager interface {
 	// recorded as empty. WithLabelValues can be called multiple times
 	// and then accumulates values.
 	WithLabelValues(labels map[string]string) (CSIMetricsManager, error)
-
-	// HaveAdditionalLabel can be used to check if the additional label
-	// value is defined in the metrics manager
-	HaveAdditionalLabel(name string) bool
 
 	// SetDriverName is called to update the CSI driver name. This should be done
 	// as soon as possible, otherwise metrics recorded by this manager will be
@@ -153,13 +146,6 @@ func WithLabels(labels map[string]string) MetricsManagerOption {
 			return l[i].name < l[j].name
 		})
 		cmm.additionalLabels = l
-	}
-}
-
-// WithMigration adds the migrated field to the current metrics label
-func WithMigration() MetricsManagerOption {
-	return func(cmm *csiMetricsManager) {
-		cmm.additionalLabelNames = append(cmm.additionalLabelNames, LabelMigrated)
 	}
 }
 
@@ -330,7 +316,7 @@ func (cmmv *csiMetricsManagerWithValues) WithLabelValues(labels map[string]strin
 	}
 	// Now add all new values.
 	for name, value := range labels {
-		if !extended.HaveAdditionalLabel(name) {
+		if !extended.haveAdditionalLabel(name) {
 			return nil, fmt.Errorf("label %q was not defined via WithLabelNames", name)
 		}
 		if v, ok := extended.additionalValues[name]; ok {
@@ -341,7 +327,7 @@ func (cmmv *csiMetricsManagerWithValues) WithLabelValues(labels map[string]strin
 	return extended, nil
 }
 
-func (cmm *csiMetricsManager) HaveAdditionalLabel(name string) bool {
+func (cmm *csiMetricsManager) haveAdditionalLabel(name string) bool {
 	for _, n := range cmm.additionalLabelNames {
 		if n == name {
 			return true

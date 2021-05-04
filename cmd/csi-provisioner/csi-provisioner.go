@@ -28,13 +28,10 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -45,9 +42,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 	utilflag "k8s.io/component-base/cli/flag"
-	"k8s.io/component-base/metrics/legacyregistry"
-	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
-	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
@@ -93,7 +87,7 @@ var (
 	enableCapacity           = flag.Bool("enable-capacity", false, "This enables producing CSIStorageCapacity objects with capacity information from the driver's GetCapacity call.")
 	capacityImmediateBinding = flag.Bool("capacity-for-immediate-binding", false, "Enables producing capacity information for storage classes with immediate binding. Not needed for the Kubernetes scheduler, maybe useful for other consumers or for debugging.")
 	capacityPollInterval     = flag.Duration("capacity-poll-interval", time.Minute, "How long the external-provisioner waits before checking for storage capacity changes.")
-	capacityOwnerrefLevel    = flag.Int("capacity-ownerref-level", 1, "The level indicates the number of objects that need to be traversed starting from the pod identified by the POD_NAME and POD_NAMESPACE environment variables to reach the owning object for CSIStorageCapacity objects: -1 for no owner, 0 for the pod itself, 1 for a StatefulSet or DaemonSet, 2 for a Deployment, etc.")
+	capacityOwnerrefLevel    = flag.Int("capacity-ownerref-level", 1, "The level indicates the number of objects that need to be traversed starting from the pod identified by the POD_NAME and POD_NAMESPACE environment variables to reach the owning object for CSIStorageCapacity objects: 0 for the pod itself, 1 for a StatefulSet, 2 for a Deployment, etc.")
 
 	enableNodeDeployment           = flag.Bool("node-deployment", false, "Enables deploying the external-provisioner together with a CSI driver on nodes to manage node-local volumes.")
 	nodeDeploymentImmediateBinding = flag.Bool("node-deployment-immediate-binding", true, "Determines whether immediate binding is supported when deployed on each node.")
@@ -186,11 +180,7 @@ func main() {
 		klog.Fatalf("Error getting server version: %v", err)
 	}
 
-	metricsManager := metrics.NewCSIMetricsManagerWithOptions("", /* driverName */
-		// Will be provided via default gatherer.
-		metrics.WithProcessStartTime(false),
-		metrics.WithSubsystem(metrics.SubsystemSidecar),
-	)
+	metricsManager := metrics.NewCSIMetricsManager("" /* driverName */)
 
 	grpcClient, err := ctrl.Connect(*csiEndpoint, metricsManager)
 	if err != nil {
@@ -210,46 +200,19 @@ func main() {
 		klog.Fatalf("Error getting CSI driver name: %s", err)
 	}
 	klog.V(2).Infof("Detected CSI driver %s", provisionerName)
-	metricsManager.SetDriverName(provisionerName)
-
-	translator := csitrans.New()
-	supportsMigrationFromInTreePluginName := ""
-	if translator.IsMigratedCSIDriverByName(provisionerName) {
-		supportsMigrationFromInTreePluginName, err = translator.GetInTreeNameFromCSIName(provisionerName)
-		if err != nil {
-			klog.Fatalf("Failed to get InTree plugin name for migrated CSI plugin %s: %v", provisionerName, err)
-		}
-		klog.V(2).Infof("Supports migration from in-tree plugin: %s", supportsMigrationFromInTreePluginName)
-
-		// Create a new connection with the metrics manager with migrated label
-		metricsManager = metrics.NewCSIMetricsManagerWithOptions(provisionerName, metrics.WithMigration())
-		migratedGrpcClient, err := ctrl.Connect(*csiEndpoint, metricsManager)
-		if err != nil {
-			klog.Error(err.Error())
-			os.Exit(1)
-		}
-		grpcClient.Close()
-		grpcClient = migratedGrpcClient
-
-		err = ctrl.Probe(grpcClient, *operationTimeout)
-		if err != nil {
-			klog.Error(err.Error())
-			os.Exit(1)
-		}
-	}
 
 	// Prepare http endpoint for metrics + leader election healthz
 	mux := http.NewServeMux()
-	gatherers := prometheus.Gatherers{
-		// For workqueue and leader election metrics, set up via the anonymous imports of:
-		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/workqueue/metrics.go
-		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/clientgo/leaderelection/metrics.go
-		//
-		// Also to happens to include Go runtime and process metrics:
-		// https://github.com/kubernetes/kubernetes/blob/9780d88cb6a4b5b067256ecb4abf56892093ee87/staging/src/k8s.io/component-base/metrics/legacyregistry/registry.go#L46-L49
-		legacyregistry.DefaultGatherer,
-		// For CSI operations.
-		metricsManager.GetRegistry(),
+	if addr != "" {
+		metricsManager.RegisterToServer(mux, *metricsPath)
+		metricsManager.SetDriverName(provisionerName)
+		go func() {
+			klog.Infof("ServeMux listening at %q", addr)
+			err := http.ListenAndServe(addr, mux)
+			if err != nil {
+				klog.Fatalf("Failed to start HTTP server at specified address (%q) and metrics path (%q): %s", addr, *metricsPath, err)
+			}
+		}()
 	}
 
 	pluginCapabilities, controllerCapabilities, err := ctrl.GetDriverCapabilities(grpcClient, *operationTimeout)
@@ -363,7 +326,15 @@ func main() {
 		controller.NodesLister(nodeLister),
 	}
 
-	if supportsMigrationFromInTreePluginName != "" {
+	translator := csitrans.New()
+
+	supportsMigrationFromInTreePluginName := ""
+	if translator.IsMigratedCSIDriverByName(provisionerName) {
+		supportsMigrationFromInTreePluginName, err = translator.GetInTreeNameFromCSIName(provisionerName)
+		if err != nil {
+			klog.Fatalf("Failed to get InTree plugin name for migrated CSI plugin %s: %v", provisionerName, err)
+		}
+		klog.V(2).Infof("Supports migration from in-tree plugin: %s", supportsMigrationFromInTreePluginName)
 		provisionerOptions = append(provisionerOptions, controller.AdditionalProvisionerNames([]string{supportsMigrationFromInTreePluginName}))
 	}
 
@@ -394,30 +365,39 @@ func main() {
 		nodeDeployment,
 	)
 
+	provisionController = controller.NewProvisionController(
+		clientset,
+		provisionerName,
+		csiProvisioner,
+		serverVersion.GitVersion,
+		provisionerOptions...,
+	)
+
+	csiClaimController := ctrl.NewCloningProtectionController(
+		clientset,
+		claimLister,
+		claimInformer,
+		claimQueue,
+		controllerCapabilities,
+	)
+
 	var capacityController *capacity.Controller
 	if *enableCapacity {
-		namespace := os.Getenv("NAMESPACE")
-		if namespace == "" {
-			klog.Fatal("need NAMESPACE env variable for CSIStorageCapacity objects")
+		podName := os.Getenv("POD_NAME")
+		namespace := os.Getenv("POD_NAMESPACE")
+		if podName == "" || namespace == "" {
+			klog.Fatalf("need POD_NAMESPACE/POD_NAME env variables, have only POD_NAMESPACE=%q and POD_NAME=%q", namespace, podName)
 		}
-		var controller *metav1.OwnerReference
-		if *capacityOwnerrefLevel >= 0 {
-			podName := os.Getenv("POD_NAME")
-			if podName == "" {
-				klog.Fatal("need POD_NAME env variable to determine CSIStorageCapacity owner")
-			}
-			var err error
-			controller, err = owner.Lookup(config, namespace, podName,
-				schema.GroupVersionKind{
-					Group:   "",
-					Version: "v1",
-					Kind:    "Pod",
-				}, *capacityOwnerrefLevel)
-			if err != nil {
-				klog.Fatalf("look up owner(s) of pod: %v", err)
-			}
-			klog.Infof("using %s/%s %s as owner of CSIStorageCapacity objects", controller.APIVersion, controller.Kind, controller.Name)
+		controller, err := owner.Lookup(config, namespace, podName,
+			schema.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Pod",
+			}, *capacityOwnerrefLevel)
+		if err != nil {
+			klog.Fatalf("look up owner(s) of pod: %v", err)
 		}
+		klog.Infof("using %s/%s %s as owner of CSIStorageCapacity objects", controller.APIVersion, controller.Kind, controller.Name)
 
 		var topologyInformer topology.Informer
 		if nodeDeployment == nil {
@@ -439,85 +419,27 @@ func main() {
 			topologyInformer = topology.NewFixedNodeTopology(&segment)
 		}
 
-		managedByID := "external-provisioner"
-		if *enableNodeDeployment {
-			managedByID += "-" + node
-		}
-
 		// We only need objects from our own namespace. The normal factory would give
-		// us an informer for the entire cluster. We can further restrict the
-		// watch to just those objects with the right labels.
+		// us an informer for the entire cluster.
 		factoryForNamespace = informers.NewSharedInformerFactoryWithOptions(clientset,
 			ctrl.ResyncPeriodOfCsiNodeInformer,
 			informers.WithNamespace(namespace),
-			informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
-				lo.LabelSelector = labels.Set{
-					capacity.DriverNameLabel: provisionerName,
-					capacity.ManagedByLabel:  managedByID,
-				}.AsSelector().String()
-			}),
 		)
 
 		capacityController = capacity.NewCentralCapacityController(
 			csi.NewControllerClient(grpcClient),
 			provisionerName,
 			clientset,
-			// Metrics for the queue is available in the default registry.
+			// TODO: metrics for the queue?!
 			workqueue.NewNamedRateLimitingQueue(rateLimiter, "csistoragecapacity"),
-			controller,
-			managedByID,
+			*controller,
 			namespace,
 			topologyInformer,
 			factory.Storage().V1().StorageClasses(),
-			factoryForNamespace.Storage().V1beta1().CSIStorageCapacities(),
+			factoryForNamespace.Storage().V1alpha1().CSIStorageCapacities(),
 			*capacityPollInterval,
 			*capacityImmediateBinding,
 		)
-		legacyregistry.CustomMustRegister(capacityController)
-
-		// Wrap Provision and Delete to detect when it is time to refresh capacity.
-		csiProvisioner = capacity.NewProvisionWrapper(csiProvisioner, capacityController)
-	}
-
-	provisionController = controller.NewProvisionController(
-		clientset,
-		provisionerName,
-		csiProvisioner,
-		serverVersion.GitVersion,
-		provisionerOptions...,
-	)
-
-	csiClaimController := ctrl.NewCloningProtectionController(
-		clientset,
-		claimLister,
-		claimInformer,
-		claimQueue,
-		controllerCapabilities,
-	)
-
-	// Start HTTP server, regardless whether we are the leader or not.
-	if addr != "" {
-		// To collect metrics data from the metric handler itself, we
-		// let it register itself and then collect from that registry.
-		reg := prometheus.NewRegistry()
-		gatherers = append(gatherers, reg)
-
-		// This is similar to k8s.io/component-base/metrics HandlerWithReset
-		// except that we gather from multiple sources. This is necessary
-		// because both CSI metrics manager and component-base manage
-		// their own registry. Probably could be avoided by making
-		// CSI metrics manager a bit more flexible.
-		mux.Handle(*metricsPath,
-			promhttp.InstrumentMetricHandler(
-				reg,
-				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
-		go func() {
-			klog.Infof("ServeMux listening at %q", addr)
-			err := http.ListenAndServe(addr, mux)
-			if err != nil {
-				klog.Fatalf("Failed to start HTTP server at specified address (%q) and metrics path (%q): %s", addr, *metricsPath, err)
-			}
-		}()
 	}
 
 	run := func(ctx context.Context) {
