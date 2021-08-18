@@ -201,14 +201,12 @@ func (nt *nodeTopology) List() []*Segment {
 	return segments
 }
 
-func (nt *nodeTopology) Run(ctx context.Context) {
-	go nt.nodeInformer.Informer().Run(ctx.Done())
-	go nt.csiNodeInformer.Informer().Run(ctx.Done())
-	go nt.runWorker(ctx)
+func (nt *nodeTopology) RunWorker(ctx context.Context) {
+	klog.Info("Started node topology worker")
+	defer klog.Info("Shutting node topology worker")
 
-	klog.Info("Started node topology informer")
-	<-ctx.Done()
-	klog.Info("Shutting node topology informer")
+	for nt.processNextWorkItem(ctx) {
+	}
 }
 
 func (nt *nodeTopology) HasSynced() bool {
@@ -220,11 +218,6 @@ func (nt *nodeTopology) HasSynced() bool {
 		return true
 	}
 	return false
-}
-
-func (nt *nodeTopology) runWorker(ctx context.Context) {
-	for nt.processNextWorkItem(ctx) {
-	}
 }
 
 func (nt *nodeTopology) processNextWorkItem(ctx context.Context) bool {
