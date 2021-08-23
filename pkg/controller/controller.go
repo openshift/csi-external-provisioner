@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-csi/csi-lib-utils/accessmodes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -49,14 +50,14 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/util"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/util"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
-	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v3/apis/volumesnapshot/v1beta1"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v3/clientset/versioned"
+	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 )
 
 //secretParamsMap provides a mapping of current as well as deprecated secret keys
@@ -258,6 +259,7 @@ type csiProvisioner struct {
 	extraCreateMetadata                   bool
 	eventRecorder                         record.EventRecorder
 	nodeDeployment                        *internalNodeDeployment
+	controllerPublishReadOnly             bool
 }
 
 var _ controller.Provisioner = &csiProvisioner{}
@@ -336,6 +338,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	extraCreateMetadata bool,
 	defaultFSType string,
 	nodeDeployment *NodeDeployment,
+	controllerPublishReadOnly bool,
 ) controller.Provisioner {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(klog.Infof)
@@ -368,6 +371,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		vaLister:                              vaLister,
 		extraCreateMetadata:                   extraCreateMetadata,
 		eventRecorder:                         eventRecorder,
+		controllerPublishReadOnly:             controllerPublishReadOnly,
 	}
 	if nodeDeployment != nil {
 		provisioner.nodeDeployment = &internalNodeDeployment{
@@ -451,42 +455,53 @@ func getAccessTypeMount(fsType string, mountFlags []string) *csi.VolumeCapabilit
 	}
 }
 
-func getAccessMode(pvcAccessMode v1.PersistentVolumeAccessMode) *csi.VolumeCapability_AccessMode {
-	switch pvcAccessMode {
-	case v1.ReadWriteOnce:
-		return &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		}
-	case v1.ReadWriteMany:
-		return &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-		}
-	case v1.ReadOnlyMany:
-		return &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
-		}
-	default:
-		return nil
-	}
-}
-
 func getVolumeCapability(
 	claim *v1.PersistentVolumeClaim,
 	sc *storagev1.StorageClass,
 	pvcAccessMode v1.PersistentVolumeAccessMode,
 	fsType string,
-) *csi.VolumeCapability {
+	supportsSingleNodeMultiWriter bool,
+) (*csi.VolumeCapability, error) {
+	accessMode, err := accessmodes.ToCSIAccessMode([]v1.PersistentVolumeAccessMode{pvcAccessMode}, supportsSingleNodeMultiWriter)
+	if err != nil {
+		return nil, err
+	}
+
 	if util.CheckPersistentVolumeClaimModeBlock(claim) {
 		return &csi.VolumeCapability{
 			AccessType: getAccessTypeBlock(),
-			AccessMode: getAccessMode(pvcAccessMode),
-		}
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: accessMode,
+			},
+		}, nil
 	}
 	return &csi.VolumeCapability{
 		AccessType: getAccessTypeMount(fsType, sc.MountOptions),
-		AccessMode: getAccessMode(pvcAccessMode),
+		AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: accessMode,
+		},
+	}, nil
+}
+
+func (p *csiProvisioner) getVolumeCapabilities(
+	claim *v1.PersistentVolumeClaim,
+	sc *storagev1.StorageClass,
+	fsType string,
+) ([]*csi.VolumeCapability, error) {
+	supportsSingleNodeMultiWriter := false
+	if p.controllerCapabilities[csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER] {
+		supportsSingleNodeMultiWriter = true
 	}
 
+	volumeCaps := make([]*csi.VolumeCapability, 0)
+	for _, pvcAccessMode := range claim.Spec.AccessModes {
+		volumeCap, err := getVolumeCapability(claim, sc, pvcAccessMode, fsType, supportsSingleNodeMultiWriter)
+		if err != nil {
+			return []*csi.VolumeCapability{}, err
+		}
+		volumeCaps = append(volumeCaps, volumeCap)
+	}
+	return volumeCaps, nil
 }
 
 type prepareProvisionResult struct {
@@ -581,10 +596,9 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 	capacity := claim.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
 	volSizeBytes := capacity.Value()
 
-	// Get access mode
-	volumeCaps := make([]*csi.VolumeCapability, 0)
-	for _, pvcAccessMode := range claim.Spec.AccessModes {
-		volumeCaps = append(volumeCaps, getVolumeCapability(claim, sc, pvcAccessMode, fsType))
+	volumeCaps, err := p.getVolumeCapabilities(claim, sc, fsType)
+	if err != nil {
+		return nil, controller.ProvisioningFinished, err
 	}
 
 	// Create a CSI CreateVolumeRequest and Response
@@ -799,9 +813,17 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 			return nil, controller.ProvisioningInBackground, sourceErr
 		}
 	}
+	pvReadOnly := false
+	volCaps := req.GetVolumeCapabilities()
+	// if the request only has one accessmode and if its ROX, set readonly to true
+	// TODO: check for the driver capability of MULTI_NODE_READER_ONLY capability from the CSI driver
+	if len(volCaps) == 1 && volCaps[0].GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY && p.controllerPublishReadOnly {
+		pvReadOnly = true
+	}
 
 	result.csiPVSource.VolumeHandle = p.volumeIdToHandle(rep.Volume.VolumeId)
 	result.csiPVSource.VolumeAttributes = volumeAttributes
+	result.csiPVSource.ReadOnly = pvReadOnly
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: pvName,
@@ -1020,7 +1042,7 @@ func (p *csiProvisioner) getPVCSource(ctx context.Context, claim *v1.PersistentV
 // getSnapshotSource verifies DataSource.Kind of type VolumeSnapshot, making sure that the requested Snapshot is available/ready
 // returns the VolumeContentSource for the requested snapshot
 func (p *csiProvisioner) getSnapshotSource(ctx context.Context, claim *v1.PersistentVolumeClaim, sc *storagev1.StorageClass) (*csi.VolumeContentSource, error) {
-	snapshotObj, err := p.snapshotClient.SnapshotV1beta1().VolumeSnapshots(claim.Namespace).Get(ctx, claim.Spec.DataSource.Name, metav1.GetOptions{})
+	snapshotObj, err := p.snapshotClient.SnapshotV1().VolumeSnapshots(claim.Namespace).Get(ctx, claim.Spec.DataSource.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error getting snapshot %s from api server: %v", claim.Spec.DataSource.Name, err)
 	}
@@ -1034,7 +1056,7 @@ func (p *csiProvisioner) getSnapshotSource(ctx context.Context, claim *v1.Persis
 		return nil, fmt.Errorf(snapshotNotBound, claim.Spec.DataSource.Name)
 	}
 
-	snapContentObj, err := p.snapshotClient.SnapshotV1beta1().VolumeSnapshotContents().Get(ctx, *snapshotObj.Status.BoundVolumeSnapshotContentName, metav1.GetOptions{})
+	snapContentObj, err := p.snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, *snapshotObj.Status.BoundVolumeSnapshotContentName, metav1.GetOptions{})
 
 	if err != nil {
 		klog.Warningf("error getting snapshotcontent %s for snapshot %s/%s from api server: %s", *snapshotObj.Status.BoundVolumeSnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, err)

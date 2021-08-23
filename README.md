@@ -1,5 +1,3 @@
-[![Build Status](https://travis-ci.org/kubernetes-csi/external-provisioner.svg?branch=master)](https://travis-ci.org/kubernetes-csi/external-provisioner)
-
 # CSI provisioner
 
 The external-provisioner is a sidecar container that dynamically provisions volumes by calling `CreateVolume` and `DeleteVolume` functions of CSI drivers. It is necessary because internal persistent volume controller running in Kubernetes controller-manager does not have any direct interfaces to CSI drivers.
@@ -13,7 +11,7 @@ This information reflects the head of this branch.
 
 | Compatible with CSI Version | Container Image | [Min K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#minimum-version) | [Recommended K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#recommended-version) |
 | ------------------------------------------------------------------------------------------ | -------------------------------| --------------- | ------------- |
-| [CSI Spec v1.4.0](https://github.com/container-storage-interface/spec/releases/tag/v1.4.0) | k8s.gcr.io/sig-storage/csi-provisioner | 1.17 | 1.21 |
+| [CSI Spec v1.5.0](https://github.com/container-storage-interface/spec/releases/tag/v1.5.0) | k8s.gcr.io/sig-storage/csi-provisioner | 1.20 | 1.22 |
 
 ## Feature status
 
@@ -23,9 +21,10 @@ Following table reflects the head of this branch.
 
 | Feature        | Status  | Default | Description                                                                                   | Provisioner Feature Gate Required |
 | -------------- | ------- | ------- | --------------------------------------------------------------------------------------------- | --------------------------------- |
-| Snapshots      | Beta    | On      | [Snapshots and Restore](https://kubernetes-csi.github.io/docs/snapshot-restore-feature.html). | No |
+| Snapshots      | GA      | On      | [Snapshots and Restore](https://kubernetes-csi.github.io/docs/snapshot-restore-feature.html). | No |
 | CSIMigration   | Beta    | On      | [Migrating in-tree volume plugins to CSI](https://kubernetes.io/docs/concepts/storage/volumes/#csi-migration). | No |
-| CSIStorageCapacity | Beta | On | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler. | No |
+| CSIStorageCapacity | Beta  | On  | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler. | No |
+| ReadWriteOncePod   | Alpha | Off | [Single pod access mode for PersistentVolumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes). | No |
 
 All other external-provisioner features and the external-provisioner itself is considered GA and fully supported.
 
@@ -50,6 +49,12 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 
 * `--leader-election-namespace`: Namespace where leader election object will be created. It is recommended that this parameter is populated from Kubernetes DownwardAPI with the namespace where the external-provisioner runs in.
 
+* `--leader-election-lease-duration <duration>`: Duration, in seconds, that non-leader candidates will wait to force acquire leadership. Defaults to 15 seconds.
+
+* `--leader-election-renew-deadline <duration>`: Duration, in seconds, that the acting leader will retry refreshing leadership before giving up. Defaults to 10 seconds.
+
+* `--leader-election-retry-period <duration>`: Duration, in seconds, the LeaderElector clients should wait between tries of actions. Defaults to 5 seconds.
+
 * `--timeout <duration>`: Timeout of all calls to CSI driver. It should be set to value that accommodates majority of `ControllerCreateVolume` and `ControllerDeleteVolume` calls. See [CSI error and timeout handling](#csi-error-and-timeout-handling) for details. 15 seconds is used by default.
 
 * `--retry-interval-start <duration>`: Initial retry interval of failed provisioning or deletion. It doubles with each failure, up to `--retry-interval-max` and then it stops increasing. Default value is 1 second. See [CSI error and timeout handling](#csi-error-and-timeout-handling) for details.
@@ -70,6 +75,7 @@ Note that the external-provisioner does not scale with more replicas. Only one e
 
 * `--extra-create-metadata`: Enables the injection of extra PVC and PV metadata as parameters when calling `CreateVolume` on the driver (keys: "csi.storage.k8s.io/pvc/name", "csi.storage.k8s.io/pvc/namespace", "csi.storage.k8s.io/pv/name")
 
+* `controller-publish-readonly`: This option enables PV to be marked as readonly at controller publish volume call if PVC accessmode has been set to ROX. Defaults to `false`.
 ##### Storage capacity arguments
 
 See the [storage capacity section](#capacity-support) below for details.

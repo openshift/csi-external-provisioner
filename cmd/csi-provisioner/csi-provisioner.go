@@ -50,7 +50,7 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -58,7 +58,7 @@ import (
 	"github.com/kubernetes-csi/external-provisioner/pkg/capacity/topology"
 	ctrl "github.com/kubernetes-csi/external-provisioner/pkg/controller"
 	"github.com/kubernetes-csi/external-provisioner/pkg/owner"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v3/clientset/versioned"
+	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 )
 
 var (
@@ -85,6 +85,10 @@ var (
 	httpEndpoint            = flag.String("http-endpoint", "", "The TCP network address where the HTTP server for diagnostics, including metrics and leader election health check, will listen (example: `:8080`). The default is empty string, which means the server is disabled. Only one of `--metrics-address` and `--http-endpoint` can be set.")
 	metricsPath             = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
 
+	leaderElectionLeaseDuration = flag.Duration("leader-election-lease-duration", 15*time.Second, "Duration, in seconds, that non-leader candidates will wait to force acquire leadership. Defaults to 15 seconds.")
+	leaderElectionRenewDeadline = flag.Duration("leader-election-renew-deadline", 10*time.Second, "Duration, in seconds, that the acting leader will retry refreshing leadership before giving up. Defaults to 10 seconds.")
+	leaderElectionRetryPeriod   = flag.Duration("leader-election-retry-period", 5*time.Second, "Duration, in seconds, the LeaderElector clients should wait between tries of actions. Defaults to 5 seconds.")
+
 	defaultFSType = flag.String("default-fstype", "", "The default filesystem type of the volume to provision when fstype is unspecified in the StorageClass. If the default is not set and fstype is unset in the StorageClass, then no fstype will be set")
 
 	kubeAPIQPS   = flag.Float32("kube-api-qps", 5, "QPS to use while communicating with the kubernetes apiserver. Defaults to 5.0.")
@@ -93,22 +97,18 @@ var (
 	enableCapacity           = flag.Bool("enable-capacity", false, "This enables producing CSIStorageCapacity objects with capacity information from the driver's GetCapacity call.")
 	capacityImmediateBinding = flag.Bool("capacity-for-immediate-binding", false, "Enables producing capacity information for storage classes with immediate binding. Not needed for the Kubernetes scheduler, maybe useful for other consumers or for debugging.")
 	capacityPollInterval     = flag.Duration("capacity-poll-interval", time.Minute, "How long the external-provisioner waits before checking for storage capacity changes.")
-	capacityOwnerrefLevel    = flag.Int("capacity-ownerref-level", 1, "The level indicates the number of objects that need to be traversed starting from the pod identified by the POD_NAME and POD_NAMESPACE environment variables to reach the owning object for CSIStorageCapacity objects: -1 for no owner, 0 for the pod itself, 1 for a StatefulSet or DaemonSet, 2 for a Deployment, etc.")
+	capacityOwnerrefLevel    = flag.Int("capacity-ownerref-level", 1, "The level indicates the number of objects that need to be traversed starting from the pod identified by the POD_NAME and NAMESPACE environment variables to reach the owning object for CSIStorageCapacity objects: -1 for no owner, 0 for the pod itself, 1 for a StatefulSet or DaemonSet, 2 for a Deployment, etc.")
 
 	enableNodeDeployment           = flag.Bool("node-deployment", false, "Enables deploying the external-provisioner together with a CSI driver on nodes to manage node-local volumes.")
 	nodeDeploymentImmediateBinding = flag.Bool("node-deployment-immediate-binding", true, "Determines whether immediate binding is supported when deployed on each node.")
 	nodeDeploymentBaseDelay        = flag.Duration("node-deployment-base-delay", 20*time.Second, "Determines how long the external-provisioner sleeps initially before trying to own a PVC with immediate binding.")
 	nodeDeploymentMaxDelay         = flag.Duration("node-deployment-max-delay", 60*time.Second, "Determines how long the external-provisioner sleeps at most before trying to own a PVC with immediate binding.")
+	controllerPublishReadOnly      = flag.Bool("controller-publish-readonly", false, "This option enables PV to be marked as readonly at controller publish volume call if PVC accessmode has been set to ROX.")
 
 	featureGates        map[string]bool
 	provisionController *controller.ProvisionController
 	version             = "unknown"
 )
-
-type leaderElection interface {
-	Run() error
-	WithNamespace(namespace string)
-}
 
 func main() {
 	var config *rest.Config
@@ -173,17 +173,10 @@ func main() {
 		klog.Fatalf("Failed to create client: %v", err)
 	}
 
-	// snapclientset.NewForConfig creates a new Clientset for VolumesnapshotV1beta1Client
+	// snapclientset.NewForConfig creates a new Clientset for  VolumesnapshotV1Client
 	snapClient, err := snapclientset.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("Failed to create snapshot client: %v", err)
-	}
-
-	// The controller needs to know what the server version is because out-of-tree
-	// provisioners aren't officially supported until 1.5
-	serverVersion, err := clientset.Discovery().ServerVersion()
-	if err != nil {
-		klog.Fatalf("Error getting server version: %v", err)
 	}
 
 	metricsManager := metrics.NewCSIMetricsManagerWithOptions("", /* driverName */
@@ -395,6 +388,7 @@ func main() {
 		*extraCreateMetadata,
 		*defaultFSType,
 		nodeDeployment,
+		*controllerPublishReadOnly,
 	)
 
 	var capacityController *capacity.Controller
@@ -441,6 +435,7 @@ func main() {
 			klog.Infof("producing CSIStorageCapacity objects with fixed topology segment %s", segment)
 			topologyInformer = topology.NewFixedNodeTopology(&segment)
 		}
+		go topologyInformer.RunWorker(context.Background())
 
 		managedByID := "external-provisioner"
 		if *enableNodeDeployment {
@@ -486,7 +481,6 @@ func main() {
 		clientset,
 		provisionerName,
 		csiProvisioner,
-		serverVersion.GitVersion,
 		provisionerOptions...,
 	)
 
@@ -549,7 +543,7 @@ func main() {
 	if !*enableLeaderElection {
 		run(context.TODO())
 	} else {
-		// this lock name pattern is also copied from sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller
+		// this lock name pattern is also copied from sigs.k8s.io/sig-storage-lib-external-provisioner/controller
 		// to preserve backwards compatibility
 		lockName := strings.Replace(provisionerName, "/", "-", -1)
 
@@ -567,6 +561,10 @@ func main() {
 		if *leaderElectionNamespace != "" {
 			le.WithNamespace(*leaderElectionNamespace)
 		}
+
+		le.WithLeaseDuration(*leaderElectionLeaseDuration)
+		le.WithRenewDeadline(*leaderElectionRenewDeadline)
+		le.WithRetryPeriod(*leaderElectionRetryPeriod)
 
 		if err := le.Run(); err != nil {
 			klog.Fatalf("failed to initialize leader election: %v", err)

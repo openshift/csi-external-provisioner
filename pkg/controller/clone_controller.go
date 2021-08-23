@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
 )
 
 //
@@ -78,8 +78,6 @@ func (p *CloningProtectionController) Run(ctx context.Context, threadiness int) 
 			p.runClaimWorker(ctx)
 		}, time.Second, ctx.Done())
 	}
-
-	go p.claimInformer.Run(ctx.Done())
 
 	klog.Infof("Started CloningProtection controller")
 	<-ctx.Done()
