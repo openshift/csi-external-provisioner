@@ -36,6 +36,7 @@ import (
 // to handle cloning protection finalizer removal after CSI cloning is finished
 type CloningProtectionController struct {
 	client        kubernetes.Interface
+	pvLister      corelisters.PersistentVolumeLister
 	claimLister   corelisters.PersistentVolumeClaimLister
 	claimInformer cache.SharedInformer
 	claimQueue    workqueue.RateLimitingInterface
@@ -44,6 +45,7 @@ type CloningProtectionController struct {
 // NewCloningProtectionController creates new controller for additional CSI claim protection capabilities
 func NewCloningProtectionController(
 	client kubernetes.Interface,
+	pvLister corelisters.PersistentVolumeLister,
 	claimLister corelisters.PersistentVolumeClaimLister,
 	claimInformer cache.SharedInformer,
 	claimQueue workqueue.RateLimitingInterface,
@@ -54,6 +56,7 @@ func NewCloningProtectionController(
 	}
 	controller := &CloningProtectionController{
 		client:        client,
+		pvLister:      pvLister,
 		claimLister:   claimLister,
 		claimInformer: claimInformer,
 		claimQueue:    claimQueue,
@@ -168,6 +171,29 @@ func (p *CloningProtectionController) syncClaimHandler(ctx context.Context, key 
 
 // syncClaim removes finalizers from a PVC, when cloning is finished
 func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.PersistentVolumeClaim) error {
+	err := p.removeCloneFinalizer(claim)
+	if err != nil {
+		return err
+	}
+
+	err = p.removeProvisioningFinalizer(claim)
+	if err != nil {
+		return err
+	}
+
+	if _, err = p.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{}); err != nil {
+		if !apierrs.IsNotFound(err) {
+			// Couldn't remove finalizer and the object still exists, the controller may
+			// try to remove the finalizer again on the next update
+			klog.Infof("failed to remove clone finalizer from PVC %v", claim.Name)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *CloningProtectionController) removeCloneFinalizer(claim *v1.PersistentVolumeClaim) error {
 	if !checkFinalizer(claim, pvcCloneFinalizer) {
 		return nil
 	}
@@ -177,7 +203,6 @@ func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.P
 	if err != nil {
 		return err
 	}
-
 	// Check for pvc state with DataSource pointing to claim
 	for _, pvc := range pvcList {
 		if pvc.Spec.DataSource == nil {
@@ -201,14 +226,31 @@ func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.P
 	}
 	claim.ObjectMeta.Finalizers = finalizers
 
-	if _, err = p.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{}); err != nil {
-		if !apierrs.IsNotFound(err) {
-			// Couldn't remove finalizer and the object still exists, the controller may
-			// try to remove the finalizer again on the next update
-			klog.Infof("failed to remove clone finalizer from PVC %v", claim.Name)
-			return err
+	return nil
+}
+
+func (p *CloningProtectionController) removeProvisioningFinalizer(claim *v1.PersistentVolumeClaim) error {
+	if !checkFinalizer(claim, pvcProvisioningFinalizer) {
+		return nil
+	}
+
+	pv, err := p.pvLister.Get(claim.Spec.VolumeName)
+	if err != nil {
+		if apierrs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	klog.Infof("Removing %q finalizer from PV %q", pvcProvisioningFinalizer, pv.Name)
+	// Apparently the PV was created, so it's time to remove the finalizer
+	finalizers := make([]string, 0)
+	for _, finalizer := range claim.ObjectMeta.Finalizers {
+		if finalizer != pvcProvisioningFinalizer {
+			finalizers = append(finalizers, finalizer)
 		}
 	}
+	claim.ObjectMeta.Finalizers = finalizers
 
 	return nil
 }
