@@ -52,7 +52,7 @@ func NewCloningProtectionController(
 	claimQueue workqueue.RateLimitingInterface,
 	controllerCapabilities rpc.ControllerCapabilitySet,
 ) *CloningProtectionController {
-	controller := &CloningProtectionController{
+	return &CloningProtectionController{
 		client:                 client,
 		pvLister:               pvLister,
 		claimLister:            claimLister,
@@ -60,7 +60,6 @@ func NewCloningProtectionController(
 		claimQueue:             claimQueue,
 		controllerCapabilities: controllerCapabilities,
 	}
-	return controller
 }
 
 // Run is a main CloningProtectionController handler
@@ -177,6 +176,8 @@ func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.P
 	}
 
 	klog.Infof("fjb ---> calling removeProvisioningFinalizer()")
+
+	klog.Infof("fjb: finalizers: %v", claim.Finalizers)
 	err = p.removeProvisioningFinalizer(claim)
 	if err != nil {
 		return err
@@ -229,25 +230,29 @@ func (p *CloningProtectionController) removeCloneFinalizer(claim *v1.PersistentV
 			finalizers = append(finalizers, finalizer)
 		}
 	}
-	claim.ObjectMeta.Finalizers = finalizers
+	claim.Finalizers = finalizers
 
 	return nil
 }
 
 func (p *CloningProtectionController) removeProvisioningFinalizer(claim *v1.PersistentVolumeClaim) error {
 	if !checkFinalizer(claim, pvcProvisioningFinalizer) {
+		klog.Infof("fjb: finalizer not found %v", claim.Finalizers)
 		return nil
 	}
 
+	klog.Infof("fjb: gettingn pv %q", claim.Spec.VolumeName)
 	pv, err := p.pvLister.Get(claim.Spec.VolumeName)
 	if err != nil {
 		if apierrs.IsNotFound(err) {
-			return nil
+			klog.Infof("fjb: not found  %v", err)
+			return err
 		}
+		klog.Infof("fjb: error  %v", err)
 		return err
 	}
 
-	klog.Infof("Removing %q finalizer from PV %q", pvcProvisioningFinalizer, pv.Name)
+	klog.Infof("fjb: removing %q finalizer from PV %q", pvcProvisioningFinalizer, pv.Name)
 	// Apparently the PV was created, so it's time to remove the finalizer
 	finalizers := make([]string, 0)
 	for _, finalizer := range claim.ObjectMeta.Finalizers {
@@ -255,7 +260,7 @@ func (p *CloningProtectionController) removeProvisioningFinalizer(claim *v1.Pers
 			finalizers = append(finalizers, finalizer)
 		}
 	}
-	claim.ObjectMeta.Finalizers = finalizers
+	claim.Finalizers = finalizers
 
 	return nil
 }
