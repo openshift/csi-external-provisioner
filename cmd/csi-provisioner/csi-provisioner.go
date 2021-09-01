@@ -537,6 +537,7 @@ func main() {
 			go capacityController.Run(ctx, int(*capacityThreads))
 		}
 		if csiClaimController != nil {
+			klog.Infof("fjb ---> starting csiclaimcontroller()")
 			go csiClaimController.Run(ctx, int(*finalizerThreads))
 		}
 		provisionController.Run(ctx)

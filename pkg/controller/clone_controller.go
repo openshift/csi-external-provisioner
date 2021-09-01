@@ -35,11 +35,12 @@ import (
 // CloningProtectionController is storing all related interfaces
 // to handle cloning protection finalizer removal after CSI cloning is finished
 type CloningProtectionController struct {
-	client        kubernetes.Interface
-	pvLister      corelisters.PersistentVolumeLister
-	claimLister   corelisters.PersistentVolumeClaimLister
-	claimInformer cache.SharedInformer
-	claimQueue    workqueue.RateLimitingInterface
+	client                 kubernetes.Interface
+	pvLister               corelisters.PersistentVolumeLister
+	claimLister            corelisters.PersistentVolumeClaimLister
+	claimInformer          cache.SharedInformer
+	claimQueue             workqueue.RateLimitingInterface
+	controllerCapabilities rpc.ControllerCapabilitySet
 }
 
 // NewCloningProtectionController creates new controller for additional CSI claim protection capabilities
@@ -51,15 +52,13 @@ func NewCloningProtectionController(
 	claimQueue workqueue.RateLimitingInterface,
 	controllerCapabilities rpc.ControllerCapabilitySet,
 ) *CloningProtectionController {
-	if !controllerCapabilities[csi.ControllerServiceCapability_RPC_CLONE_VOLUME] {
-		return nil
-	}
 	controller := &CloningProtectionController{
-		client:        client,
-		pvLister:      pvLister,
-		claimLister:   claimLister,
-		claimInformer: claimInformer,
-		claimQueue:    claimQueue,
+		client:                 client,
+		pvLister:               pvLister,
+		claimLister:            claimLister,
+		claimInformer:          claimInformer,
+		claimQueue:             claimQueue,
+		controllerCapabilities: controllerCapabilities,
 	}
 	return controller
 }
@@ -166,6 +165,7 @@ func (p *CloningProtectionController) syncClaimHandler(ctx context.Context, key 
 		return err
 	}
 
+	klog.Infof("fjb ---> calling syncClain()")
 	return p.syncClaim(ctx, claim)
 }
 
@@ -176,11 +176,13 @@ func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.P
 		return err
 	}
 
+	klog.Infof("fjb ---> calling removeProvisioningFinalizer()")
 	err = p.removeProvisioningFinalizer(claim)
 	if err != nil {
 		return err
 	}
 
+	klog.Infof("fjb ---> updating claim()")
 	if _, err = p.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{}); err != nil {
 		if !apierrs.IsNotFound(err) {
 			// Couldn't remove finalizer and the object still exists, the controller may
@@ -194,6 +196,9 @@ func (p *CloningProtectionController) syncClaim(ctx context.Context, claim *v1.P
 }
 
 func (p *CloningProtectionController) removeCloneFinalizer(claim *v1.PersistentVolumeClaim) error {
+	if !p.controllerCapabilities[csi.ControllerServiceCapability_RPC_CLONE_VOLUME] {
+		return nil
+	}
 	if !checkFinalizer(claim, pvcCloneFinalizer) {
 		return nil
 	}
