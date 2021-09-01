@@ -133,9 +133,9 @@ func (p *CloningProtectionController) enqueueClaimUpdate(ctx context.Context, ob
 	}
 
 	// Timestamp didn't appear
-	if new.DeletionTimestamp == nil {
-		return
-	}
+	// if new.DeletionTimestamp == nil {
+	// return
+	// }
 
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
