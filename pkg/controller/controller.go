@@ -45,13 +45,12 @@ import (
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/util"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v8/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v8/util"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -115,13 +114,6 @@ const (
 	pvcNamespaceKey = "csi.storage.k8s.io/pvc/namespace"
 	pvNameKey       = "csi.storage.k8s.io/pv/name"
 
-	// Defines parameters for ExponentialBackoff used for executing
-	// CSI CreateVolume API call, it gives approx 4 minutes for the CSI
-	// driver to complete a volume creation.
-	backoffDuration = time.Second * 5
-	backoffFactor   = 1.2
-	backoffSteps    = 10
-
 	snapshotKind     = "VolumeSnapshot"
 	snapshotAPIGroup = snapapi.GroupName       // "snapshot.storage.k8s.io"
 	pvcKind          = "PersistentVolumeClaim" // Native types don't require an API group
@@ -134,9 +126,11 @@ const (
 
 	deleteVolumeRetryCount = 5
 
-	annMigratedTo         = "pv.kubernetes.io/migrated-to"
-	annStorageProvisioner = "volume.beta.kubernetes.io/storage-provisioner"
-	annSelectedNode       = "volume.kubernetes.io/selected-node"
+	annMigratedTo = "pv.kubernetes.io/migrated-to"
+	// TODO: Beta will be deprecated and removed in a later release
+	annBetaStorageProvisioner = "volume.beta.kubernetes.io/storage-provisioner"
+	annStorageProvisioner     = "volume.kubernetes.io/storage-provisioner"
+	annSelectedNode           = "volume.kubernetes.io/selected-node"
 
 	snapshotNotBound = "snapshot %s not bound"
 
@@ -243,7 +237,6 @@ type csiProvisioner struct {
 	volumeNamePrefix                      string
 	defaultFSType                         string
 	volumeNameUUIDLength                  int
-	config                                *rest.Config
 	driverName                            string
 	pluginCapabilities                    rpc.PluginCapabilitySet
 	controllerCapabilities                rpc.ControllerCapabilitySet
@@ -268,7 +261,7 @@ var _ controller.Qualifier = &csiProvisioner{}
 
 var (
 	// Each provisioner have a identify string to distinguish with others. This
-	// identify string will be added in PV annoations under this key.
+	// identify string will be added in PV annotations under this key.
 	provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
 )
 
@@ -707,13 +700,17 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 
 func (p *csiProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
 	claim := options.PVC
-	if claim.Annotations[annStorageProvisioner] != p.driverName && claim.Annotations[annMigratedTo] != p.driverName {
+	provisioner, ok := claim.Annotations[annStorageProvisioner]
+	if !ok {
+		provisioner = claim.Annotations[annBetaStorageProvisioner]
+	}
+	if provisioner != p.driverName && claim.Annotations[annMigratedTo] != p.driverName {
 		// The storage provisioner annotation may not equal driver name but the
 		// PVC could have annotation "migrated-to" which is the new way to
 		// signal a PVC is migrated (k8s v1.17+)
 		return nil, controller.ProvisioningFinished, &controller.IgnoredError{
 			Reason: fmt.Sprintf("PVC annotated with external-provisioner name %s does not match provisioner driver name %s. This could mean the PVC is not migrated",
-				claim.Annotations[annStorageProvisioner],
+				provisioner,
 				p.driverName),
 		}
 
@@ -1238,7 +1235,10 @@ func (p *csiProvisioner) SupportsBlock(ctx context.Context) bool {
 }
 
 func (p *csiProvisioner) ShouldProvision(ctx context.Context, claim *v1.PersistentVolumeClaim) bool {
-	provisioner := claim.Annotations[annStorageProvisioner]
+	provisioner, ok := claim.Annotations[annStorageProvisioner]
+	if !ok {
+		provisioner = claim.Annotations[annBetaStorageProvisioner]
+	}
 	migratedTo := claim.Annotations[annMigratedTo]
 	if provisioner != p.driverName && migratedTo != p.driverName {
 		// Non-migrated in-tree volume is requested.
@@ -1738,8 +1738,9 @@ func checkError(err error, mayReschedule bool) controller.ProvisioningState {
 			// may succeed elsewhere -> give up for now
 			return controller.ProvisioningReschedule
 		}
-		// may still succeed at a later time -> continue
-		return controller.ProvisioningInBackground
+		// We still assume that gRPRC message size limits are large enough, see above.
+		// The CSI driver has run out of space, provisioning is not in progress.
+		return controller.ProvisioningFinished
 	case codes.Canceled, // gRPC: Client Application cancelled the request
 		codes.DeadlineExceeded, // gRPC: Timeout
 		codes.Unavailable,      // gRPC: Server shutting down, TCP connection broken - previous CreateVolume() may be still in progress.

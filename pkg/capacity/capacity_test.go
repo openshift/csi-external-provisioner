@@ -58,6 +58,7 @@ func init() {
 }
 
 const (
+	timeout        = 10 * time.Second
 	driverName     = "test-driver"
 	ownerNamespace = "testns"
 	csiscRev       = "CSISC-REV-"
@@ -1361,6 +1362,7 @@ func fakeController(ctx context.Context, client *fakeclientset.Clientset, owner 
 		cInformer,
 		1000*time.Hour, // Not used, but even if it was, we wouldn't want automatic capacity polling while the test runs...
 		immediateBinding,
+		timeout,
 	)
 
 	// This ensures that the informers are running and up-to-date.
@@ -1379,6 +1381,10 @@ type rateLimitingQueue struct {
 	mutex        sync.Mutex
 	items        []interface{}
 	shuttingDown bool
+}
+
+func (r *rateLimitingQueue) ShutDownWithDrain() {
+	klog.Error("ShutDownWithDrain is unimplemented")
 }
 
 var _ workqueue.RateLimitingInterface = &rateLimitingQueue{}

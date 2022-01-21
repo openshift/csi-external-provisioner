@@ -18,11 +18,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v8/controller"
 )
 
 //
-// This package introduce a way to handle finalizers, related to in-progress PVC cloning. This is a two step approach:
+// This package introduces a way to handle finalizers, related to in-progress PVC cloning. This is a two-step approach:
 //
 // 1) PVC referenced as a data source is now updated with a finalizer `provisioner.storage.kubernetes.io/cloning-protection` during a ProvisionExt method call.
 // The detection of cloning in-progress is based on the assumption that a PVC with `spec.DataSource` pointing on a another PVC will go into `Pending` state.
