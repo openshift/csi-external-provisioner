@@ -46,7 +46,7 @@ import (
 	utilfeaturetesting "k8s.io/component-base/featuregate/testing"
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v8/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -73,7 +73,7 @@ var (
 	volumeModeFileSystem = v1.PersistentVolumeFilesystem
 	volumeModeBlock      = v1.PersistentVolumeBlock
 
-	driverNameAnnotation = map[string]string{annStorageProvisioner: driverName}
+	driverNameAnnotation = map[string]string{annBetaStorageProvisioner: driverName}
 	translatedKey        = "translated"
 	defaultfsType        = "ext4"
 )
@@ -106,8 +106,10 @@ func createMockServer(t *testing.T, tmpdir string) (*gomock.Controller,
 		Identity:   identityServer,
 		Controller: controllerServer,
 	})
-	drv.StartOnAddress("unix", filepath.Join(tmpdir, "csi.sock"))
-
+	err := drv.StartOnAddress("unix", filepath.Join(tmpdir, "csi.sock"))
+	if err != nil {
+		return nil, nil, nil, nil, csiConnection{}, err
+	}
 	// Create a client connection to it
 	addr := drv.Address()
 	csiConn, err := New(addr)
@@ -501,7 +503,7 @@ func provisionFromPVCCapabilities() (rpc.PluginCapabilitySet, rpc.ControllerCapa
 var fakeSCName = "fake-test-sc"
 
 func createFakeNamedPVC(requestBytes int64, name string, userAnnotations map[string]string) *v1.PersistentVolumeClaim {
-	annotations := map[string]string{annStorageProvisioner: driverName}
+	annotations := map[string]string{annBetaStorageProvisioner: driverName}
 	for k, v := range userAnnotations {
 		annotations[k] = v
 	}
@@ -3436,12 +3438,12 @@ func TestProvisionErrorHandling(t *testing.T) {
 	const requestBytes = 100
 
 	testcases := map[codes.Code]controller.ProvisioningState{
-		codes.ResourceExhausted: controller.ProvisioningInBackground,
-		codes.Canceled:          controller.ProvisioningInBackground,
-		codes.DeadlineExceeded:  controller.ProvisioningInBackground,
-		codes.Unavailable:       controller.ProvisioningInBackground,
-		codes.Aborted:           controller.ProvisioningInBackground,
+		codes.Canceled:         controller.ProvisioningInBackground,
+		codes.DeadlineExceeded: controller.ProvisioningInBackground,
+		codes.Unavailable:      controller.ProvisioningInBackground,
+		codes.Aborted:          controller.ProvisioningInBackground,
 
+		codes.ResourceExhausted:  controller.ProvisioningFinished,
 		codes.Unknown:            controller.ProvisioningFinished,
 		codes.InvalidArgument:    controller.ProvisioningFinished,
 		codes.NotFound:           controller.ProvisioningFinished,
@@ -4501,11 +4503,23 @@ func TestProvisionWithMigration(t *testing.T) {
 		{
 			name:              "provision with migration on",
 			scProvisioner:     inTreePluginName,
+			annotation:        map[string]string{annBetaStorageProvisioner: driverName},
+			expectTranslation: true,
+		},
+		{
+			name:              "provision with migration on with GA annStorageProvisioner annontation",
+			scProvisioner:     inTreePluginName,
 			annotation:        map[string]string{annStorageProvisioner: driverName},
 			expectTranslation: true,
 		},
 		{
 			name:              "provision without migration for native CSI",
+			scProvisioner:     driverName,
+			annotation:        map[string]string{annBetaStorageProvisioner: driverName},
+			expectTranslation: false,
+		},
+		{
+			name:              "provision without migration for native CSI with GA annStorageProvisioner annontation",
 			scProvisioner:     driverName,
 			annotation:        map[string]string{annStorageProvisioner: driverName},
 			expectTranslation: false,
@@ -4513,31 +4527,31 @@ func TestProvisionWithMigration(t *testing.T) {
 		{
 			name:              "provision with migration for migrated-to CSI",
 			scProvisioner:     inTreePluginName,
-			annotation:        map[string]string{annStorageProvisioner: inTreePluginName, annMigratedTo: driverName},
+			annotation:        map[string]string{annBetaStorageProvisioner: inTreePluginName, annMigratedTo: driverName},
 			expectTranslation: true,
 		},
 		{
 			name:          "provision with migration-to some random driver",
 			scProvisioner: inTreePluginName,
-			annotation:    map[string]string{annStorageProvisioner: inTreePluginName, annMigratedTo: "foo"},
+			annotation:    map[string]string{annBetaStorageProvisioner: inTreePluginName, annMigratedTo: "foo"},
 			expectErr:     true,
 		},
 		{
 			name:          "provision with migration-to some random driver with random storageProvisioner",
 			scProvisioner: inTreePluginName,
-			annotation:    map[string]string{annStorageProvisioner: "foo", annMigratedTo: "foo"},
+			annotation:    map[string]string{annBetaStorageProvisioner: "foo", annMigratedTo: "foo"},
 			expectErr:     true,
 		},
 		{
 			name:              "provision with migration for migrated-to CSI with CSI Provisioner",
 			scProvisioner:     inTreePluginName,
-			annotation:        map[string]string{annStorageProvisioner: driverName, annMigratedTo: driverName},
+			annotation:        map[string]string{annBetaStorageProvisioner: driverName, annMigratedTo: driverName},
 			expectTranslation: true,
 		},
 		{
 			name:          "ignore in-tree PVC when provisioned by in-tree",
 			scProvisioner: inTreePluginName,
-			annotation:    map[string]string{annStorageProvisioner: inTreePluginName},
+			annotation:    map[string]string{annBetaStorageProvisioner: inTreePluginName},
 			expectErr:     true,
 		},
 	}

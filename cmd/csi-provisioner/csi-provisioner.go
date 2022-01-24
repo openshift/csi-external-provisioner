@@ -20,6 +20,7 @@ import (
 	"context"
 	goflag "flag"
 	"fmt"
+	"github.com/kubernetes-csi/external-provisioner/pkg/features"
 	"math/rand"
 	"net/http"
 	"os"
@@ -50,7 +51,7 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v8/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -73,7 +74,7 @@ var (
 	workerThreads        = flag.Uint("worker-threads", 100, "Number of provisioner worker threads, in other words nr. of simultaneous CSI calls.")
 	finalizerThreads     = flag.Uint("cloning-protection-threads", 1, "Number of simultaneously running threads, handling cloning finalizer removal")
 	capacityThreads      = flag.Uint("capacity-threads", 1, "Number of simultaneously running threads, handling CSIStorageCapacity objects")
-	operationTimeout     = flag.Duration("timeout", 10*time.Second, "Timeout for waiting for creation or deletion of a volume")
+	operationTimeout     = flag.Duration("timeout", 10*time.Second, "Timeout for waiting for volume operation (creation, deletion, capacity queries)")
 
 	enableLeaderElection = flag.Bool("leader-election", false, "Enables leader election. If leader election is enabled, additional RBAC rules are required. Please refer to the Kubernetes CSI documentation for instructions on setting up these RBAC rules.")
 
@@ -359,6 +360,10 @@ func main() {
 		controller.NodesLister(nodeLister),
 	}
 
+	if utilfeature.DefaultFeatureGate.Enabled(features.HonorPVReclaimPolicy) {
+		provisionerOptions = append(provisionerOptions, controller.AddFinalizer(true))
+	}
+
 	if supportsMigrationFromInTreePluginName != "" {
 		provisionerOptions = append(provisionerOptions, controller.AdditionalProvisionerNames([]string{supportsMigrationFromInTreePluginName}))
 	}
@@ -470,6 +475,7 @@ func main() {
 			factoryForNamespace.Storage().V1beta1().CSIStorageCapacities(),
 			*capacityPollInterval,
 			*capacityImmediateBinding,
+			*operationTimeout,
 		)
 		legacyregistry.CustomMustRegister(capacityController)
 
