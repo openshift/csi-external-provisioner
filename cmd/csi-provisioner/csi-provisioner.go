@@ -20,9 +20,9 @@ import (
 	"context"
 	goflag "flag"
 	"fmt"
-	"github.com/kubernetes-csi/external-provisioner/pkg/features"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
@@ -34,9 +34,11 @@ import (
 	flag "github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	validation "k8s.io/apimachinery/pkg/util/validation"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -58,8 +60,9 @@ import (
 	"github.com/kubernetes-csi/external-provisioner/pkg/capacity"
 	"github.com/kubernetes-csi/external-provisioner/pkg/capacity/topology"
 	ctrl "github.com/kubernetes-csi/external-provisioner/pkg/controller"
+	"github.com/kubernetes-csi/external-provisioner/pkg/features"
 	"github.com/kubernetes-csi/external-provisioner/pkg/owner"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v6/clientset/versioned"
 )
 
 var (
@@ -83,8 +86,9 @@ var (
 	immediateTopology       = flag.Bool("immediate-topology", true, "Immediate binding: pass aggregated cluster topologies for all nodes where the CSI driver is available (enabled, the default) or no topology requirements (if disabled).")
 	extraCreateMetadata     = flag.Bool("extra-create-metadata", false, "If set, add pv/pvc metadata to plugin create requests as parameters.")
 	metricsAddress          = flag.String("metrics-address", "", "(deprecated) The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled. Only one of `--metrics-address` and `--http-endpoint` can be set.")
-	httpEndpoint            = flag.String("http-endpoint", "", "The TCP network address where the HTTP server for diagnostics, including metrics and leader election health check, will listen (example: `:8080`). The default is empty string, which means the server is disabled. Only one of `--metrics-address` and `--http-endpoint` can be set.")
+	httpEndpoint            = flag.String("http-endpoint", "", "The TCP network address where the HTTP server for diagnostics, including pprof, metrics and leader election health check, will listen (example: `:8080`). The default is empty string, which means the server is disabled. Only one of `--metrics-address` and `--http-endpoint` can be set.")
 	metricsPath             = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
+	enableProfile           = flag.Bool("enable-pprof", false, "Enable pprof profiling on the TCP network address specified by --http-endpoint. The HTTP path is `/debug/pprof/`.")
 
 	leaderElectionLeaseDuration = flag.Duration("leader-election-lease-duration", 15*time.Second, "Duration, in seconds, that non-leader candidates will wait to force acquire leadership. Defaults to 15 seconds.")
 	leaderElectionRenewDeadline = flag.Duration("leader-election-renew-deadline", 10*time.Second, "Duration, in seconds, that the acting leader will retry refreshing leadership before giving up. Defaults to 10 seconds.")
@@ -94,6 +98,9 @@ var (
 
 	kubeAPIQPS   = flag.Float32("kube-api-qps", 5, "QPS to use while communicating with the kubernetes apiserver. Defaults to 5.0.")
 	kubeAPIBurst = flag.Int("kube-api-burst", 10, "Burst to use while communicating with the kubernetes apiserver. Defaults to 10.")
+
+	kubeAPICapacityQPS   = flag.Float32("kube-api-capacity-qps", 1, "QPS to use for storage capacity updates while communicating with the kubernetes apiserver. Defaults to 1.0.")
+	kubeAPICapacityBurst = flag.Int("kube-api-capacity-burst", 5, "Burst to use for storage capacity updates while communicating with the kubernetes apiserver. Defaults to 5.")
 
 	enableCapacity           = flag.Bool("enable-capacity", false, "This enables producing CSIStorageCapacity objects with capacity information from the driver's GetCapacity call.")
 	capacityImmediateBinding = flag.Bool("capacity-for-immediate-binding", false, "Enables producing capacity information for storage classes with immediate binding. Not needed for the Kubernetes scheduler, maybe useful for other consumers or for debugging.")
@@ -105,6 +112,8 @@ var (
 	nodeDeploymentBaseDelay        = flag.Duration("node-deployment-base-delay", 20*time.Second, "Determines how long the external-provisioner sleeps initially before trying to own a PVC with immediate binding.")
 	nodeDeploymentMaxDelay         = flag.Duration("node-deployment-max-delay", 60*time.Second, "Determines how long the external-provisioner sleeps at most before trying to own a PVC with immediate binding.")
 	controllerPublishReadOnly      = flag.Bool("controller-publish-readonly", false, "This option enables PV to be marked as readonly at controller publish volume call if PVC accessmode has been set to ROX.")
+
+	preventVolumeModeConversion = flag.Bool("prevent-volume-mode-conversion", false, "Prevents an unauthorised user from modifying the volume mode when creating a PVC from an existing VolumeSnapshot.")
 
 	featureGates        map[string]bool
 	provisionController *controller.ProvisionController
@@ -122,6 +131,8 @@ func main() {
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.Set("logtostderr", "true")
 	flag.Parse()
+
+	ctx := context.Background()
 
 	if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(featureGates); err != nil {
 		klog.Fatal(err)
@@ -394,10 +405,20 @@ func main() {
 		*defaultFSType,
 		nodeDeployment,
 		*controllerPublishReadOnly,
+		*preventVolumeModeConversion,
 	)
 
 	var capacityController *capacity.Controller
 	if *enableCapacity {
+		// Publishing storage capacity information uses its own client
+		// with separate rate limiting.
+		config.QPS = *kubeAPICapacityQPS
+		config.Burst = *kubeAPICapacityBurst
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Fatalf("Failed to create client: %v", err)
+		}
+
 		namespace := os.Getenv("NAMESPACE")
 		if namespace == "" {
 			klog.Fatal("need NAMESPACE env variable for CSIStorageCapacity objects")
@@ -440,11 +461,11 @@ func main() {
 			klog.Infof("producing CSIStorageCapacity objects with fixed topology segment %s", segment)
 			topologyInformer = topology.NewFixedNodeTopology(&segment)
 		}
-		go topologyInformer.RunWorker(context.Background())
+		go topologyInformer.RunWorker(ctx)
 
 		managedByID := "external-provisioner"
 		if *enableNodeDeployment {
-			managedByID += "-" + node
+			managedByID = getNameWithMaxLength(managedByID, node, validation.DNS1035LabelMaxLength)
 		}
 
 		// We only need objects from our own namespace. The normal factory would give
@@ -461,10 +482,37 @@ func main() {
 			}),
 		)
 
+		// We use the V1 CSIStorageCapacity API if available.
+		clientFactory := capacity.NewV1ClientFactory(clientset)
+		cInformer := factoryForNamespace.Storage().V1().CSIStorageCapacities()
+
+		// This invalid object is used in a v1 Create call to determine
+		// based on the resulting error whether the v1 API is supported.
+		invalidCapacity := &storagev1.CSIStorageCapacity{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "#%123-invalid-name",
+			},
+		}
+		createdCapacity, err := clientset.StorageV1().CSIStorageCapacities("default").Create(ctx, invalidCapacity, metav1.CreateOptions{})
+		switch {
+		case err == nil:
+			klog.Fatalf("creating an invalid v1.CSIStorageCapacity didn't fail as expected, got: %s", createdCapacity)
+		case apierrors.IsNotFound(err):
+			// We need to bridge between the v1beta1 API on the
+			// server and the v1 API expected by the capacity code.
+			klog.Info("using the CSIStorageCapacity v1beta1 API")
+			clientFactory = capacity.NewV1beta1ClientFactory(clientset)
+			cInformer = capacity.NewV1beta1InformerBridge(factoryForNamespace.Storage().V1beta1().CSIStorageCapacities())
+		case apierrors.IsInvalid(err):
+			klog.Info("using the CSIStorageCapacity v1 API")
+		default:
+			klog.Fatalf("unexpected error when checking for the V1 CSIStorageCapacity API: %v", err)
+		}
+
 		capacityController = capacity.NewCentralCapacityController(
 			csi.NewControllerClient(grpcClient),
 			provisionerName,
-			clientset,
+			clientFactory,
 			// Metrics for the queue is available in the default registry.
 			workqueue.NewNamedRateLimitingQueue(rateLimiter, "csistoragecapacity"),
 			controller,
@@ -472,7 +520,7 @@ func main() {
 			namespace,
 			topologyInformer,
 			factory.Storage().V1().StorageClasses(),
-			factoryForNamespace.Storage().V1beta1().CSIStorageCapacities(),
+			cInformer,
 			*capacityPollInterval,
 			*capacityImmediateBinding,
 			*operationTimeout,
@@ -514,6 +562,16 @@ func main() {
 			promhttp.InstrumentMetricHandler(
 				reg,
 				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
+
+		if *enableProfile {
+			klog.InfoS("Starting profiling", "endpoint", httpEndpoint)
+
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		}
 		go func() {
 			klog.Infof("ServeMux listening at %q", addr)
 			err := http.ListenAndServe(addr, mux)
@@ -547,7 +605,7 @@ func main() {
 	}
 
 	if !*enableLeaderElection {
-		run(context.TODO())
+		run(ctx)
 	} else {
 		// this lock name pattern is also copied from sigs.k8s.io/sig-storage-lib-external-provisioner/controller
 		// to preserve backwards compatibility
@@ -571,10 +629,10 @@ func main() {
 		le.WithLeaseDuration(*leaderElectionLeaseDuration)
 		le.WithRenewDeadline(*leaderElectionRenewDeadline)
 		le.WithRetryPeriod(*leaderElectionRetryPeriod)
+		le.WithIdentity(identity)
 
 		if err := le.Run(); err != nil {
 			klog.Fatalf("failed to initialize leader election: %v", err)
 		}
 	}
-
 }
