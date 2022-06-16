@@ -55,11 +55,11 @@ import (
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
-	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
+	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v6/clientset/versioned"
 )
 
-//secretParamsMap provides a mapping of current as well as deprecated secret keys
+// secretParamsMap provides a mapping of current as well as deprecated secret keys
 type secretParamsMap struct {
 	name                         string
 	deprecatedSecretNameKey      string
@@ -132,9 +132,16 @@ const (
 	annStorageProvisioner     = "volume.kubernetes.io/storage-provisioner"
 	annSelectedNode           = "volume.kubernetes.io/selected-node"
 
+	// Annotation for secret name and namespace will be added to the pv object
+	// and used at pvc deletion time.
+	annDeletionProvisionerSecretRefName      = "volume.kubernetes.io/provisioner-deletion-secret-name"
+	annDeletionProvisionerSecretRefNamespace = "volume.kubernetes.io/provisioner-deletion-secret-namespace"
+
 	snapshotNotBound = "snapshot %s not bound"
 
 	pvcCloneFinalizer = "provisioner.storage.kubernetes.io/cloning-protection"
+
+	annAllowVolumeModeChange = "snapshot.storage.kubernetes.io/allowVolumeModeChange"
 )
 
 var (
@@ -253,17 +260,18 @@ type csiProvisioner struct {
 	eventRecorder                         record.EventRecorder
 	nodeDeployment                        *internalNodeDeployment
 	controllerPublishReadOnly             bool
+	preventVolumeModeConversion           bool
 }
 
-var _ controller.Provisioner = &csiProvisioner{}
-var _ controller.BlockProvisioner = &csiProvisioner{}
-var _ controller.Qualifier = &csiProvisioner{}
-
 var (
-	// Each provisioner have a identify string to distinguish with others. This
-	// identify string will be added in PV annotations under this key.
-	provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
+	_ controller.Provisioner      = &csiProvisioner{}
+	_ controller.BlockProvisioner = &csiProvisioner{}
+	_ controller.Qualifier        = &csiProvisioner{}
 )
+
+// Each provisioner have a identify string to distinguish with others. This
+// identify string will be added in PV annotations under this key.
+var provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
 
 func Connect(address string, metricsManager metrics.CSIMetricsManager) (*grpc.ClientConn, error) {
 	return connection.Connect(address, metricsManager, connection.OnConnectionLoss(connection.ExitOnConnectionLoss()))
@@ -332,6 +340,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	defaultFSType string,
 	nodeDeployment *NodeDeployment,
 	controllerPublishReadOnly bool,
+	preventVolumeModeConversion bool,
 ) controller.Provisioner {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(klog.Infof)
@@ -365,6 +374,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		extraCreateMetadata:                   extraCreateMetadata,
 		eventRecorder:                         eventRecorder,
 		controllerPublishReadOnly:             controllerPublishReadOnly,
+		preventVolumeModeConversion:           preventVolumeModeConversion,
 	}
 	if nodeDeployment != nil {
 		provisioner.nodeDeployment = &internalNodeDeployment{
@@ -374,6 +384,9 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		// Remove deleted PVCs from rate limiter.
 		claimHandler := cache.ResourceEventHandlerFuncs{
 			DeleteFunc: func(obj interface{}) {
+				if unknown, ok := obj.(cache.DeletedFinalStateUnknown); ok && unknown.Obj != nil {
+					obj = unknown.Obj
+				}
 				if claim, ok := obj.(*v1.PersistentVolumeClaim); ok {
 					provisioner.nodeDeployment.rateLimiter.Forget(claim.UID)
 				}
@@ -430,7 +443,6 @@ func makeVolumeName(prefix, pvcUID string, volumeNameUUIDLength int) (string, er
 	}
 	// Else we remove all dashes from UUID and truncate to volumeNameUUIDLength
 	return fmt.Sprintf("%s-%s", prefix, strings.Replace(string(pvcUID), "-", "", -1)[0:volumeNameUUIDLength]), nil
-
 }
 
 func getAccessTypeBlock() *csi.VolumeCapability_Block {
@@ -497,11 +509,17 @@ func (p *csiProvisioner) getVolumeCapabilities(
 	return volumeCaps, nil
 }
 
+type deletionSecretParams struct {
+	name      string
+	namespace string
+}
+
 type prepareProvisionResult struct {
-	fsType         string
-	migratedVolume bool
-	req            *csi.CreateVolumeRequest
-	csiPVSource    *v1.CSIPersistentVolumeSource
+	fsType              string
+	migratedVolume      bool
+	req                 *csi.CreateVolumeRequest
+	csiPVSource         *v1.CSIPersistentVolumeSource
+	provDeletionSecrets *deletionSecretParams
 }
 
 // prepareProvision does non-destructive parameter checking and preparations for provisioning a volume.
@@ -689,13 +707,21 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 		req.Parameters[pvcNamespaceKey] = claim.GetNamespace()
 		req.Parameters[pvNameKey] = pvName
 	}
+	deletionAnnSecrets := new(deletionSecretParams)
+
+	if provisionerSecretRef != nil {
+		deletionAnnSecrets.name = provisionerSecretRef.Name
+		deletionAnnSecrets.namespace = provisionerSecretRef.Namespace
+	}
 
 	return &prepareProvisionResult{
-		fsType:         fsType,
-		migratedVolume: migratedVolume,
-		req:            &req,
-		csiPVSource:    csiPVSource,
+		fsType:              fsType,
+		migratedVolume:      migratedVolume,
+		req:                 &req,
+		csiPVSource:         csiPVSource,
+		provDeletionSecrets: deletionAnnSecrets,
 	}, controller.ProvisioningNoChange, nil
+
 }
 
 func (p *csiProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
@@ -713,7 +739,6 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 				provisioner,
 				p.driverName),
 		}
-
 	}
 
 	// The same check already ran in ShouldProvision, but perhaps
@@ -742,7 +767,6 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 	createCtx, cancel := context.WithTimeout(createCtx, p.timeout)
 	defer cancel()
 	rep, err := p.csiClient.CreateVolume(createCtx, req)
-
 	if err != nil {
 		// Giving up after an error and telling the pod scheduler to retry with a different node
 		// only makes sense if:
@@ -779,7 +803,7 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 	}
 	respCap := rep.GetVolume().GetCapacityBytes()
 
-	//According to CSI spec CreateVolume should be able to return capacity = 0, which means it is unknown. for example NFS/FTP
+	// According to CSI spec CreateVolume should be able to return capacity = 0, which means it is unknown. for example NFS/FTP
 	if respCap == 0 {
 		respCap = volSizeBytes
 		klog.V(3).Infof("csiClient response volume with size 0, which is not supported by apiServer, will use claim size:%d", respCap)
@@ -836,6 +860,16 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 				CSI: result.csiPVSource,
 			},
 		},
+	}
+
+	// Set annDeletionSecretRefName and namespace in PV object.
+	if result.provDeletionSecrets != nil {
+		klog.V(5).Infof("createVolumeOperation: set annotation [%s/%s] on pv [%s].", annDeletionProvisionerSecretRefNamespace, annDeletionProvisionerSecretRefName, pv.Name)
+		metav1.SetMetaDataAnnotation(&pv.ObjectMeta, annDeletionProvisionerSecretRefName, result.provDeletionSecrets.name)
+		metav1.SetMetaDataAnnotation(&pv.ObjectMeta, annDeletionProvisionerSecretRefNamespace, result.provDeletionSecrets.namespace)
+	} else {
+		metav1.SetMetaDataAnnotation(&pv.ObjectMeta, annDeletionProvisionerSecretRefName, "")
+		metav1.SetMetaDataAnnotation(&pv.ObjectMeta, annDeletionProvisionerSecretRefNamespace, "")
 	}
 
 	if options.StorageClass.ReclaimPolicy != nil {
@@ -963,11 +997,6 @@ func (p *csiProvisioner) getPVCSource(ctx context.Context, claim *v1.PersistentV
 		return nil, fmt.Errorf("the requested PVC (%s) storageclass cannot be empty", claim.Name)
 	}
 
-	if *sourcePVC.Spec.StorageClassName != *claim.Spec.StorageClassName {
-		return nil, fmt.Errorf("the source PVC and destination PVCs must be in the same storage class for cloning.  Source is in %v, but new PVC is in %v",
-			*sourcePVC.Spec.StorageClassName, *claim.Spec.StorageClassName)
-	}
-
 	capacity := claim.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
 	requestedSize := capacity.Value()
 	srcCapacity := sourcePVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
@@ -1054,7 +1083,6 @@ func (p *csiProvisioner) getSnapshotSource(ctx context.Context, claim *v1.Persis
 	}
 
 	snapContentObj, err := p.snapshotClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, *snapshotObj.Status.BoundVolumeSnapshotContentName, metav1.GetOptions{})
-
 	if err != nil {
 		klog.Warningf("error getting snapshotcontent %s for snapshot %s/%s from api server: %s", *snapshotObj.Status.BoundVolumeSnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, err)
 		return nil, fmt.Errorf(snapshotNotBound, claim.Spec.DataSource.Name)
@@ -1101,6 +1129,27 @@ func (p *csiProvisioner) getSnapshotSource(ctx context.Context, claim *v1.Persis
 		}
 		if int64(volSizeBytes) > int64(snapshotObj.Status.RestoreSize.Value()) {
 			klog.Warningf("requested volume size %d is greater than the size %d for the source snapshot %s. Volume plugin needs to handle volume expansion.", int64(volSizeBytes), int64(snapshotObj.Status.RestoreSize.Value()), snapshotObj.Name)
+		}
+	}
+
+	if p.preventVolumeModeConversion {
+		if snapContentObj.Spec.SourceVolumeMode != nil && claim.Spec.VolumeMode != nil && snapContentObj.Spec.SourceVolumeMode != claim.Spec.VolumeMode {
+			// Attempt to modify volume mode during volume creation.
+			// Verify if this volume is allowed to alter its mode.
+			allowVolumeModeChange, ok := snapContentObj.Annotations[annAllowVolumeModeChange]
+			if !ok {
+				return nil, fmt.Errorf("requested volume %s/%s modifies the mode of the source volume but does not have permission to do so. "+
+					"%s annotation is not present on snapshotcontent %s", claim.Namespace, claim.Name, annAllowVolumeModeChange, snapContentObj.Name)
+			}
+			allowVolumeModeChangeBool, err := strconv.ParseBool(allowVolumeModeChange)
+			if err != nil {
+				return nil, fmt.Errorf("requested volume %s/%s modifies the mode of the source volume but does not have permission to do so. "+
+					"failed to convert %s annotation value to boolean with error: %v", claim.Namespace, claim.Name, annAllowVolumeModeChange, err)
+			}
+			if !allowVolumeModeChangeBool {
+				return nil, fmt.Errorf("requested volume %s/%s modifies the mode of the source volume but does not have permission to do so. "+
+					"%s is set to false on snapshotcontent %s", claim.Namespace, claim.Name, annAllowVolumeModeChange, snapContentObj.Name)
+			}
 		}
 	}
 
@@ -1159,6 +1208,52 @@ func (p *csiProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume
 	req := csi.DeleteVolumeRequest{
 		VolumeId: volumeId,
 	}
+
+	err = p.handleSecretsForDeletion(ctx, volume, &req, migratedVolume)
+	if err != nil {
+		return err
+	}
+	deleteCtx := markAsMigrated(ctx, migratedVolume)
+	deleteCtx, cancel := context.WithTimeout(deleteCtx, p.timeout)
+	defer cancel()
+
+	if err := p.canDeleteVolume(volume); err != nil {
+		return err
+	}
+
+	_, err = p.csiClient.DeleteVolume(deleteCtx, &req)
+
+	return err
+}
+
+func (p *csiProvisioner) handleSecretsForDeletion(ctx context.Context, volume *v1.PersistentVolume, req *csi.DeleteVolumeRequest, migratedVolume bool) error {
+	var err error
+	if metav1.HasAnnotation(volume.ObjectMeta, annDeletionProvisionerSecretRefName) && metav1.HasAnnotation(volume.ObjectMeta, annDeletionProvisionerSecretRefNamespace) {
+		annDeletionSecretName := volume.Annotations[annDeletionProvisionerSecretRefName]
+		annDeletionSecretNamespace := volume.Annotations[annDeletionProvisionerSecretRefNamespace]
+		if annDeletionSecretName != "" && annDeletionSecretNamespace != "" {
+			provisionerSecretRef := &v1.SecretReference{}
+			provisionerSecretRef.Name = annDeletionSecretName
+			provisionerSecretRef.Namespace = annDeletionSecretNamespace
+			credentials, err := getCredentials(ctx, p.client, provisionerSecretRef)
+			if err != nil {
+				// Continue with deletion, as the secret may have already been deleted.
+				klog.Errorf("failed to get credentials for volume %s: %s", volume.Name, err.Error())
+			}
+			req.Secrets = credentials
+		} else if annDeletionSecretName == "" && annDeletionSecretNamespace == "" {
+			klog.V(2).Infof("volume %s does not need any deletion secrets", volume.Name)
+		}
+	} else {
+		err := p.getSecretsFromSC(ctx, volume, migratedVolume, req)
+		if err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func (p *csiProvisioner) getSecretsFromSC(ctx context.Context, volume *v1.PersistentVolume, migratedVolume bool, req *csi.DeleteVolumeRequest) error {
 	// get secrets if StorageClass specifies it
 	storageClassName := util.GetPersistentVolumeClass(volume)
 	if len(storageClassName) != 0 {
@@ -1192,17 +1287,7 @@ func (p *csiProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume
 			klog.Warningf("failed to get storageclass: %s, proceeding to delete without secrets. %v", storageClassName, err)
 		}
 	}
-	deleteCtx := markAsMigrated(ctx, migratedVolume)
-	deleteCtx, cancel := context.WithTimeout(deleteCtx, p.timeout)
-	defer cancel()
-
-	if err := p.canDeleteVolume(volume); err != nil {
-		return err
-	}
-
-	_, err = p.csiClient.DeleteVolume(deleteCtx, &req)
-
-	return err
+	return nil
 }
 
 func (p *csiProvisioner) canDeleteVolume(volume *v1.PersistentVolume) error {
@@ -1270,7 +1355,7 @@ func (p *csiProvisioner) ShouldProvision(ctx context.Context, claim *v1.Persiste
 	return true
 }
 
-//TODO use a unique volume handle from and to Id
+// TODO use a unique volume handle from and to Id
 func (p *csiProvisioner) volumeIdToHandle(id string) string {
 	return id
 }
