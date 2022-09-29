@@ -3,7 +3,7 @@
 The external-provisioner is a sidecar container that dynamically provisions volumes by calling `CreateVolume` and `DeleteVolume` functions of CSI drivers. It is necessary because internal persistent volume controller running in Kubernetes controller-manager does not have any direct interfaces to CSI drivers.
 
 ## Overview
-The external-provisioner is an external controller that monitors `PersistentVolumeClaim` objects created by user and creates/deletes volumes for them. Full design can be found at Kubernetes proposal at [container-storage-interface.md](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/storage/container-storage-interface.md)
+The external-provisioner is an external controller that monitors `PersistentVolumeClaim` objects created by user and creates/deletes volumes for them. Full design can be found at Kubernetes proposal at [container-storage-interface.md](https://github.com/kubernetes/design-proposals-archive/blob/main/storage/container-storage-interface.md)
 
 ## Compatibility
 
@@ -11,7 +11,7 @@ This information reflects the head of this branch.
 
 | Compatible with CSI Version | Container Image | [Min K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#minimum-version) | [Recommended K8s Version](https://kubernetes-csi.github.io/docs/kubernetes-compatibility.html#recommended-version) |
 | ------------------------------------------------------------------------------------------ | -------------------------------| --------------- | ------------- |
-| [CSI Spec v1.5.0](https://github.com/container-storage-interface/spec/releases/tag/v1.5.0) | k8s.gcr.io/sig-storage/csi-provisioner | 1.20 | 1.22 |
+| [CSI Spec v1.6.0](https://github.com/container-storage-interface/spec/releases/tag/v1.6.0) | k8s.gcr.io/sig-storage/csi-provisioner | 1.20 | 1.25 |
 
 ## Feature status
 
@@ -22,11 +22,12 @@ Following table reflects the head of this branch.
 | Feature        | Status  | Default | Description                                                                                                                                                          | Provisioner Feature Gate Required |
 | -------------- | ------- | ------- |----------------------------------------------------------------------------------------------------------------------------------------------------------------------| --------------------------------- |
 | Snapshots      | GA      | On      | [Snapshots and Restore](https://kubernetes-csi.github.io/docs/snapshot-restore-feature.html).                                                                        | No |
-| CSIMigration   | Beta    | On      | [Migrating in-tree volume plugins to CSI](https://kubernetes.io/docs/concepts/storage/volumes/#csi-migration).                                                       | No |
-| CSIStorageCapacity | Beta  | On  | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler.                                  | No |
+| CSIMigration   | GA    | On      | [Migrating in-tree volume plugins to CSI](https://kubernetes.io/docs/concepts/storage/volumes/#csi-migration).                                                       | No |
+| CSIStorageCapacity | GA  | On  | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler.                                  | No |
 | ReadWriteOncePod   | Alpha | Off | [Single pod access mode for PersistentVolumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).                                        | No |
-| HonorPVReclaimPolicy| Alpha |Off | [Honor the PV reclaim policy](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/2644-honor-pv-reclaim-policy)                                  | No
-| PreventVolumeModeConversion | Alpha |Off | [Prevent unauthorized conversion of source volume mode](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3141-prevent-volume-mode-conversion) | `--prevent-volume-mode-conversion` (No in-tree feature gate)
+| HonorPVReclaimPolicy| Alpha |Off | [Honor the PV reclaim policy](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/2644-honor-pv-reclaim-policy)                                  | No |
+| PreventVolumeModeConversion | Alpha |Off | [Prevent unauthorized conversion of source volume mode](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3141-prevent-volume-mode-conversion) | `--prevent-volume-mode-conversion` (No in-tree feature gate) |
+| CSINodeExpandSecret | Alpha |Off | [CSI Node expansion secret](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3107-csi-nodeexpandsecret)                                  | No
 
 All other external-provisioner features and the external-provisioner itself is considered GA and fully supported.
 
@@ -132,13 +133,13 @@ See the [storage capacity section](#capacity-support) below for details.
 
 External-provisioner interacts with Kubernetes by watching PVCs and
 PVs and implementing the [external provisioner
-protocol](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/storage/container-storage-interface.md#provisioning-and-deleting).
+protocol](https://github.com/kubernetes/design-proposals-archive/blob/main/storage/container-storage-interface.md#provisioning-and-deleting).
 The [design document](./doc/design.md) explains this in more detail.
 
 ### Topology support
 When `Topology` feature is enabled and the driver specifies `VOLUME_ACCESSIBILITY_CONSTRAINTS` in its plugin capabilities, external-provisioner prepares `CreateVolumeRequest.AccessibilityRequirements` while calling `Controller.CreateVolume`. The driver has to consider these topology constraints while creating the volume. Below table shows how these `AccessibilityRequirements` are prepared:
 
-[Delayed binding](https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode) | Strict topology | [Allowed topologies](https://kubernetes.io/docs/concepts/storage/storage-classes/#allowed-topologies) | Immediate Topology | [Resulting accessability requirements](https://github.com/container-storage-interface/spec/blob/master/spec.md#createvolume)
+[Delayed binding](https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode) | Strict topology | [Allowed topologies](https://kubernetes.io/docs/concepts/storage/storage-classes/#allowed-topologies) | Immediate Topology | [Resulting accessibility requirements](https://github.com/container-storage-interface/spec/blob/master/spec.md#createvolume)
 :---: |:---:|:---:|:---:|:---|
 Yes | Yes | Irrelevant | Irrelevant | `Requisite` = `Preferred` = Selected node topology
 Yes | No  | No  | Irrelevant | `Requisite` = Aggregated cluster topology<br>`Preferred` = `Requisite` with selected node topology as first element
