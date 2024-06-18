@@ -46,8 +46,8 @@ import (
 	"k8s.io/component-base/featuregate"
 	utilfeaturetesting "k8s.io/component-base/featuregate/testing"
 	csitrans "k8s.io/csi-translation-lib"
-	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v9/controller"
+	klog "k8s.io/klog/v2"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -89,7 +89,8 @@ type csiConnection struct {
 
 func New(address string) (csiConnection, error) {
 	metricsManager := metrics.NewCSIMetricsManager("fake.csi.driver.io" /* driverName */)
-	conn, err := connection.Connect(address, metricsManager)
+	ctx := context.Background()
+	conn, err := connection.Connect(ctx, address, metricsManager)
 	if err != nil {
 		return csiConnection{}, err
 	}
@@ -721,6 +722,23 @@ func TestGetSecretReference(t *testing.T) {
 				},
 			},
 			expectErr: true,
+		},
+		"template - valid PVC annotations for Provision and Delete": {
+			secretParams: provisionerSecretParams,
+			params: map[string]string{
+				prefixedProvisionerSecretNamespaceKey: "static-${pvc.namespace}",
+				prefixedProvisionerSecretNameKey:      "static-${pvc.name}-${pvc.annotations['akey']}",
+			},
+			pvName: "pvname",
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "name",
+					Namespace:   "pvcnamespace",
+					Annotations: map[string]string{"akey": "avalue"},
+				},
+			},
+			expectErr: false,
+			expectRef: &v1.SecretReference{Name: "static-name-avalue", Namespace: "static-pvcnamespace"},
 		},
 		"template - valid nodepublish secret ref": {
 			secretParams: nodePublishSecretParams,
@@ -6462,10 +6480,6 @@ func TestProvisionFromPVC(t *testing.T) {
 	for k, tc := range testcases {
 		tc := tc
 		t.Run(k, func(t *testing.T) {
-			// TODO: https://github.com/kubernetes-csi/external-provisioner/issues/833
-			if !tc.xnsEnabled {
-				t.Parallel()
-			}
 			var clientSet *fakeclientset.Clientset
 
 			// Phase: setup mock server
