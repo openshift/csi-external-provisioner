@@ -25,13 +25,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"google.golang.org/grpc/internal"
 )
-
-func init() {
-	internal.FromOutgoingContextRaw = fromOutgoingContextRaw
-}
 
 // DecodeKeyValue returns k, v, nil.
 //
@@ -88,21 +82,6 @@ func Pairs(kv ...string) MD {
 		md[key] = append(md[key], kv[i+1])
 	}
 	return md
-}
-
-// String implements the Stringer interface for pretty-printing a MD.
-// Ordering of the values is non-deterministic as it ranges over a map.
-func (md MD) String() string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "MD{")
-	for k, v := range md {
-		if sb.Len() > 3 {
-			fmt.Fprintf(&sb, ", ")
-		}
-		fmt.Fprintf(&sb, "%s=[%s]", k, strings.Join(v, ", "))
-	}
-	fmt.Fprintf(&sb, "}")
-	return sb.String()
 }
 
 // Len returns the number of items in md.
@@ -259,13 +238,16 @@ func copyOf(v []string) []string {
 	return vals
 }
 
-// fromOutgoingContextRaw returns the un-merged, intermediary contents of rawMD.
+// FromOutgoingContextRaw returns the un-merged, intermediary contents of rawMD.
 //
 // Remember to perform strings.ToLower on the keys, for both the returned MD (MD
 // is a map, there's no guarantee it's created using our helper functions) and
 // the extra kv pairs (AppendToOutgoingContext doesn't turn them into
 // lowercase).
-func fromOutgoingContextRaw(ctx context.Context) (MD, [][]string, bool) {
+//
+// This is intended for gRPC-internal use ONLY. Users should use
+// FromOutgoingContext instead.
+func FromOutgoingContextRaw(ctx context.Context) (MD, [][]string, bool) {
 	raw, ok := ctx.Value(mdOutgoingKey{}).(rawMD)
 	if !ok {
 		return nil, nil, false

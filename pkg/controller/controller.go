@@ -50,9 +50,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	klog "k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/util"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v9/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v9/util"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -288,12 +288,12 @@ var (
 // identify string will be added in PV annotations under this key.
 var provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
 
-func Connect(ctx context.Context, address string, metricsManager metrics.CSIMetricsManager) (*grpc.ClientConn, error) {
-	return connection.Connect(ctx, address, metricsManager, connection.OnConnectionLoss(connection.ExitOnConnectionLoss()))
+func Connect(address string, metricsManager metrics.CSIMetricsManager) (*grpc.ClientConn, error) {
+	return connection.Connect(address, metricsManager, connection.OnConnectionLoss(connection.ExitOnConnectionLoss()))
 }
 
-func Probe(ctx context.Context, conn *grpc.ClientConn, singleCallTimeout time.Duration) error {
-	return rpc.ProbeForever(ctx, conn, singleCallTimeout)
+func Probe(conn *grpc.ClientConn, singleCallTimeout time.Duration) error {
+	return rpc.ProbeForever(conn, singleCallTimeout)
 }
 
 func GetDriverName(conn *grpc.ClientConn, timeout time.Duration) (string, error) {
@@ -697,7 +697,12 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 	}
 
 	// Resolve provision secret credentials.
-	provisionerSecretRef, err := getSecretReference(provisionerSecretParams, sc.Parameters, pvName, claim)
+	provisionerSecretRef, err := getSecretReference(provisionerSecretParams, sc.Parameters, pvName, &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claim.Name,
+			Namespace: claim.Namespace,
+		},
+	})
 	if err != nil {
 		return nil, controller.ProvisioningNoChange, err
 	}
@@ -978,10 +983,9 @@ func (p *csiProvisioner) setCloneFinalizer(ctx context.Context, pvc *v1.Persiste
 		return err
 	}
 
-	clone := claim.DeepCopy()
-	if !checkFinalizer(clone, pvcCloneFinalizer) {
-		clone.Finalizers = append(clone.Finalizers, pvcCloneFinalizer)
-		_, err := p.client.CoreV1().PersistentVolumeClaims(clone.Namespace).Update(ctx, clone, metav1.UpdateOptions{})
+	if !checkFinalizer(claim, pvcCloneFinalizer) {
+		claim.Finalizers = append(claim.Finalizers, pvcCloneFinalizer)
+		_, err := p.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
 		return err
 	}
 
