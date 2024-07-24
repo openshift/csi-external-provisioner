@@ -279,7 +279,6 @@ test-vendor:
 	@ ./release-tools/verify-vendor.sh
 
 .PHONY: test-subtree
-test: test-subtree
 test-subtree:
 	@ echo; echo "### $@:"
 	./release-tools/verify-subtree.sh release-tools
