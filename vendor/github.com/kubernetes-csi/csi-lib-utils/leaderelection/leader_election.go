@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -153,15 +153,9 @@ func (l *leaderElection) Run() error {
 		l.namespace = inClusterNamespace()
 	}
 
-	ctx := l.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	logger := klog.FromContext(ctx)
-
-	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	broadcaster := record.NewBroadcaster()
 	broadcaster.StartRecordingToSink(&corev1.EventSinkImpl{Interface: l.clientset.CoreV1().Events(l.namespace)})
-	eventRecorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: fmt.Sprintf("%s/%s", l.lockName, string(l.identity))}).WithLogger(logger)
+	eventRecorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: fmt.Sprintf("%s/%s", l.lockName, string(l.identity))})
 
 	rlConfig := resourcelock.ResourceLockConfig{
 		Identity:      sanitizeName(l.identity),
@@ -180,21 +174,23 @@ func (l *leaderElection) Run() error {
 		RetryPeriod:   l.retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				logger := klog.FromContext(ctx)
-				logger.V(2).Info("became leader, starting")
+				klog.V(2).Info("became leader, starting")
 				l.runFunc(ctx)
 			},
 			OnStoppedLeading: func() {
-				logger.Error(nil, "Stopped leading")
-				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+				klog.Fatal("stopped leading")
 			},
 			OnNewLeader: func(identity string) {
-				logger.V(3).Info("New leader detected", "leader", identity)
+				klog.V(3).Infof("new leader detected, current leader: %s", identity)
 			},
 		},
 		WatchDog: l.healthCheck,
 	}
 
+	ctx := l.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	leaderelection.RunOrDie(ctx, leaderConfig)
 	return nil // should never reach here
 }

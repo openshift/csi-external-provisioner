@@ -591,8 +591,17 @@ func (c *Controller) syncCapacity(ctx context.Context, item workItem) error {
 
 	req := &csi.GetCapacityRequest{
 		Parameters: sc.Parameters,
-		// The assumption is that the capacity is independent of the capabilities.
-		VolumeCapabilities: nil,
+		// The assumption is that the capacity is independent of the
+		// capabilities. The standard makes it mandatory to pass something,
+		// therefore we pick something rather arbitrarily.
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_UNKNOWN,
+				},
+			},
+		},
 	}
 	if item.segment != nil {
 		req.AccessibleTopology = &csi.Topology{

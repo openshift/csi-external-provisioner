@@ -85,7 +85,7 @@ func (rr *SVCB) parse(c *zlexer, o string) *ParseError {
 	l, _ := c.Next()
 	i, e := strconv.ParseUint(l.token, 10, 16)
 	if e != nil || l.err {
-		return &ParseError{file: l.token, err: "bad SVCB priority", lex: l}
+		return &ParseError{l.token, "bad SVCB priority", l}
 	}
 	rr.Priority = uint16(i)
 
@@ -95,7 +95,7 @@ func (rr *SVCB) parse(c *zlexer, o string) *ParseError {
 
 	name, nameOk := toAbsoluteName(l.token, o)
 	if l.err || !nameOk {
-		return &ParseError{file: l.token, err: "bad SVCB Target", lex: l}
+		return &ParseError{l.token, "bad SVCB Target", l}
 	}
 	rr.Target = name
 
@@ -111,7 +111,7 @@ func (rr *SVCB) parse(c *zlexer, o string) *ParseError {
 			if !canHaveNextKey {
 				// The key we can now read was probably meant to be
 				// a part of the last value.
-				return &ParseError{file: l.token, err: "bad SVCB value quotation", lex: l}
+				return &ParseError{l.token, "bad SVCB value quotation", l}
 			}
 
 			// In key=value pairs, value does not have to be quoted unless value
@@ -124,7 +124,7 @@ func (rr *SVCB) parse(c *zlexer, o string) *ParseError {
 				// Key with no value and no equality sign
 				key = l.token
 			} else if idx == 0 {
-				return &ParseError{file: l.token, err: "bad SVCB key", lex: l}
+				return &ParseError{l.token, "bad SVCB key", l}
 			} else {
 				key, value = l.token[:idx], l.token[idx+1:]
 
@@ -144,30 +144,30 @@ func (rr *SVCB) parse(c *zlexer, o string) *ParseError {
 							value = l.token
 							l, _ = c.Next()
 							if l.value != zQuote {
-								return &ParseError{file: l.token, err: "SVCB unterminated value", lex: l}
+								return &ParseError{l.token, "SVCB unterminated value", l}
 							}
 						case zQuote:
 							// There's nothing in double quotes.
 						default:
-							return &ParseError{file: l.token, err: "bad SVCB value", lex: l}
+							return &ParseError{l.token, "bad SVCB value", l}
 						}
 					}
 				}
 			}
 			kv := makeSVCBKeyValue(svcbStringToKey(key))
 			if kv == nil {
-				return &ParseError{file: l.token, err: "bad SVCB key", lex: l}
+				return &ParseError{l.token, "bad SVCB key", l}
 			}
 			if err := kv.parse(value); err != nil {
-				return &ParseError{file: l.token, wrappedErr: err, lex: l}
+				return &ParseError{l.token, err.Error(), l}
 			}
 			xs = append(xs, kv)
 		case zQuote:
-			return &ParseError{file: l.token, err: "SVCB key can't contain double quotes", lex: l}
+			return &ParseError{l.token, "SVCB key can't contain double quotes", l}
 		case zBlank:
 			canHaveNextKey = true
 		default:
-			return &ParseError{file: l.token, err: "bad SVCB values", lex: l}
+			return &ParseError{l.token, "bad SVCB values", l}
 		}
 		l, _ = c.Next()
 	}

@@ -3,8 +3,7 @@
 The external-provisioner is a sidecar container that dynamically provisions volumes by calling `CreateVolume` and `DeleteVolume` functions of CSI drivers. It is necessary because internal persistent volume controller running in Kubernetes controller-manager does not have any direct interfaces to CSI drivers.
 
 ## Overview
-The external-provisioner is an external controller that monitors `PersistentVolumeClaim` objects created by user and creates/deletes volumes for them.
-The [Kubernetes Container Storage Interface (CSI) Documentation](https://kubernetes-csi.github.io/docs/) explains how to develop, deploy, and test a Container Storage Interface (CSI) driver on Kubernetes.
+The external-provisioner is an external controller that monitors `PersistentVolumeClaim` objects created by user and creates/deletes volumes for them. Full design can be found at Kubernetes proposal at [container-storage-interface.md](https://github.com/kubernetes/design-proposals-archive/blob/main/storage/container-storage-interface.md)
 
 ## Compatibility
 
@@ -27,7 +26,7 @@ Following table reflects the head of this branch.
 | CSIStorageCapacity | GA  | On  | Publish [capacity information](https://kubernetes.io/docs/concepts/storage/volumes/#storage-capacity) for the Kubernetes scheduler.                                  | No |
 | ReadWriteOncePod   | Beta | On | [Single pod access mode for PersistentVolumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).                                        | No |
 | CSINodeExpandSecret | Beta | On | [CSI Node expansion secret](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3107-csi-nodeexpandsecret)                                  | No |
-| HonorPVReclaimPolicy| Beta | On | [Honor the PV reclaim policy](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/2644-honor-pv-reclaim-policy)                                  | No |
+| HonorPVReclaimPolicy| Alpha |Off | [Honor the PV reclaim policy](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/2644-honor-pv-reclaim-policy)                                  | No |
 | PreventVolumeModeConversion | Beta |On | [Prevent unauthorized conversion of source volume mode](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3141-prevent-volume-mode-conversion) | `--prevent-volume-mode-conversion` (No in-tree feature gate) |
 | CrossNamespaceVolumeDataSource | Alpha |Off | [Cross-namespace volume data source](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/3294-provision-volumes-from-cross-namespace-snapshots) | `--feature-gates=CrossNamespaceVolumeDataSource=true` |
 
@@ -139,7 +138,7 @@ protocol](https://github.com/kubernetes/design-proposals-archive/blob/main/stora
 The [design document](./doc/design.md) explains this in more detail.
 
 ### Topology support
-When `Topology` feature is enabled* and the driver specifies `VOLUME_ACCESSIBILITY_CONSTRAINTS` in its plugin capabilities, external-provisioner prepares `CreateVolumeRequest.AccessibilityRequirements` while calling `Controller.CreateVolume`. The driver has to consider these topology constraints while creating the volume. Below table shows how these `AccessibilityRequirements` are prepared:
+When `Topology` feature is enabled and the driver specifies `VOLUME_ACCESSIBILITY_CONSTRAINTS` in its plugin capabilities, external-provisioner prepares `CreateVolumeRequest.AccessibilityRequirements` while calling `Controller.CreateVolume`. The driver has to consider these topology constraints while creating the volume. Below table shows how these `AccessibilityRequirements` are prepared:
 
 [Delayed binding](https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode) | Strict topology | [Allowed topologies](https://kubernetes.io/docs/concepts/storage/storage-classes/#allowed-topologies) | Immediate Topology | [Resulting accessibility requirements](https://github.com/container-storage-interface/spec/blob/master/spec.md#createvolume)
 :---: |:---:|:---:|:---:|:---|
@@ -149,11 +148,6 @@ Yes | No  | Yes | Irrelevant | `Requisite` = Allowed topologies<br>`Preferred` =
 No | Irrelevant | Yes | Irrelevant | `Requisite` = Allowed topologies<br>`Preferred` = `Requisite` with randomly selected node topology as first element
 No | Irrelevant | No  | Yes | `Requisite` = Aggregated cluster topology<br>`Preferred` = `Requisite` with randomly selected node topology as first element
 No | Irrelevant | No  | No  | `Requisite` and `Preferred` both nil
-
-*) `Topology` feature gate is enabled by default since v5.0.
-<!-- TODO: remove the feature gate in the next release - remove the whole column in the table above. -->
-
-When enabling topology support in a CSI driver that had it disabled, please make sure the topology is first enabled in the driver's node DaemonSet and topology labels are populated on all nodes. The topology can be then updated in the driver's Deployment and its external-provisioner sidecar.
 
 ### Capacity support
 

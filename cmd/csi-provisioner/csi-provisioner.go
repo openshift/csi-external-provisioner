@@ -52,9 +52,9 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
-	klog "k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
-	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller/metrics"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v9/controller"
+	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v9/controller/metrics"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -210,13 +210,13 @@ func main() {
 		metrics.WithSubsystem(metrics.SubsystemSidecar),
 	)
 
-	grpcClient, err := ctrl.Connect(ctx, *csiEndpoint, metricsManager)
+	grpcClient, err := ctrl.Connect(*csiEndpoint, metricsManager)
 	if err != nil {
 		klog.Error(err.Error())
 		os.Exit(1)
 	}
 
-	err = ctrl.Probe(ctx, grpcClient, *operationTimeout)
+	err = ctrl.Probe(grpcClient, *operationTimeout)
 	if err != nil {
 		klog.Error(err.Error())
 		os.Exit(1)
@@ -244,7 +244,7 @@ func main() {
 			// Will be provided via default gatherer.
 			metrics.WithProcessStartTime(false),
 			metrics.WithMigration())
-		migratedGrpcClient, err := ctrl.Connect(ctx, *csiEndpoint, metricsManager)
+		migratedGrpcClient, err := ctrl.Connect(*csiEndpoint, metricsManager)
 		if err != nil {
 			klog.Error(err.Error())
 			os.Exit(1)
@@ -252,7 +252,7 @@ func main() {
 		grpcClient.Close()
 		grpcClient = migratedGrpcClient
 
-		err = ctrl.Probe(ctx, grpcClient, *operationTimeout)
+		err = ctrl.Probe(grpcClient, *operationTimeout)
 		if err != nil {
 			klog.Error(err.Error())
 			os.Exit(1)
@@ -553,20 +553,34 @@ func main() {
 		csiProvisioner = capacity.NewProvisionWrapper(csiProvisioner, capacityController)
 	}
 
+	provisionController = controller.NewProvisionController(
+		clientset,
+		provisionerName,
+		csiProvisioner,
+		provisionerOptions...,
+	)
+
+	csiClaimController := ctrl.NewCloningProtectionController(
+		clientset,
+		claimLister,
+		claimInformer,
+		claimQueue,
+		controllerCapabilities,
+	)
+
+	// Start HTTP server, regardless whether we are the leader or not.
 	if addr != "" {
-		// Start HTTP server, regardless whether we are the leader or not.
-		// Register provisioner metrics manually to be able to add multiplexer in front of it
-		m := libmetrics.New("controller")
+		// To collect metrics data from the metric handler itself, we
+		// let it register itself and then collect from that registry.
 		reg := prometheus.NewRegistry()
 		reg.MustRegister([]prometheus.Collector{
-			m.PersistentVolumeClaimProvisionTotal,
-			m.PersistentVolumeClaimProvisionFailedTotal,
-			m.PersistentVolumeClaimProvisionDurationSeconds,
-			m.PersistentVolumeDeleteTotal,
-			m.PersistentVolumeDeleteFailedTotal,
-			m.PersistentVolumeDeleteDurationSeconds,
+			libmetrics.PersistentVolumeClaimProvisionTotal,
+			libmetrics.PersistentVolumeClaimProvisionFailedTotal,
+			libmetrics.PersistentVolumeClaimProvisionDurationSeconds,
+			libmetrics.PersistentVolumeDeleteTotal,
+			libmetrics.PersistentVolumeDeleteFailedTotal,
+			libmetrics.PersistentVolumeDeleteDurationSeconds,
 		}...)
-		provisionerOptions = append(provisionerOptions, controller.MetricsInstance(m))
 		gatherers = append(gatherers, reg)
 
 		// This is similar to k8s.io/component-base/metrics HandlerWithReset
@@ -596,23 +610,6 @@ func main() {
 			}
 		}()
 	}
-
-	logger := klog.FromContext(ctx)
-	provisionController = controller.NewProvisionController(
-		logger,
-		clientset,
-		provisionerName,
-		csiProvisioner,
-		provisionerOptions...,
-	)
-
-	csiClaimController := ctrl.NewCloningProtectionController(
-		clientset,
-		claimLister,
-		claimInformer,
-		claimQueue,
-		controllerCapabilities,
-	)
 
 	run := func(ctx context.Context) {
 		factory.Start(ctx.Done())

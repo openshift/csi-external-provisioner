@@ -116,7 +116,7 @@ func (r *generateReader) parseError(msg string, end int) *ParseError {
 	l.token = r.s[r.si-1 : end]
 	l.column += r.si // l.column starts one zBLANK before r.s
 
-	return &ParseError{file: r.file, err: msg, lex: l}
+	return &ParseError{r.file, msg, l}
 }
 
 func (r *generateReader) Read(p []byte) (int, error) {
