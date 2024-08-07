@@ -279,6 +279,7 @@ test-vendor:
 	@ ./release-tools/verify-vendor.sh
 
 .PHONY: test-subtree
+test: test-subtree
 test-subtree:
 	@ echo; echo "### $@:"
 	./release-tools/verify-subtree.sh release-tools
@@ -321,3 +322,10 @@ test-spelling:
 test-boilerplate:
 	@ echo; echo "### $@:"
 	@ ./release-tools/verify-boilerplate.sh "$(pwd)"
+
+# Test klog usage. This test is optional and must be explicitly added to `test` target in the main Makefile:
+# test: test-logcheck
+.PHONY: test-logcheck
+test-logcheck:
+	@ echo; echo "### $@:"
+	@ ./release-tools/verify-logcheck.sh
