@@ -27,7 +27,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/accessmodes"
-	"github.com/kubernetes-csi/external-provisioner/pkg/features"
+	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -50,7 +50,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	klog "k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/util"
 
@@ -757,7 +757,7 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 	}
 
 	if vacName != "" {
-		vac, err := p.client.StorageV1alpha1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
+		vac, err := p.client.StorageV1beta1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, err
 		}

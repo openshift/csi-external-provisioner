@@ -33,7 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,14 +46,14 @@ import (
 	"k8s.io/component-base/featuregate"
 	utilfeaturetesting "k8s.io/component-base/featuregate/testing"
 	csitrans "k8s.io/csi-translation-lib"
-	klog "k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
 	"github.com/kubernetes-csi/csi-test/v5/driver"
-	"github.com/kubernetes-csi/external-provisioner/pkg/features"
+	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
 	crdv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	"github.com/kubernetes-csi/external-snapshotter/client/v6/clientset/versioned/fake"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -2326,7 +2326,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 				features.VolumeAttributesClass: true,
 			},
 			pluginCapabilities: provisionWithVACCapabilities,
-			clientSetObjects: []runtime.Object{&storagev1alpha1.VolumeAttributesClass{
+			clientSetObjects: []runtime.Object{&storagev1beta1.VolumeAttributesClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: vacName,
 				},
@@ -2379,7 +2379,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 				features.VolumeAttributesClass: false,
 			},
 			pluginCapabilities: provisionWithVACCapabilities,
-			clientSetObjects: []runtime.Object{&storagev1alpha1.VolumeAttributesClass{
+			clientSetObjects: []runtime.Object{&storagev1beta1.VolumeAttributesClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: vacName,
 				},
@@ -2448,7 +2448,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 				features.VolumeAttributesClass: true,
 			},
 			pluginCapabilities: provisionWithVACCapabilities,
-			clientSetObjects: []runtime.Object{&storagev1alpha1.VolumeAttributesClass{
+			clientSetObjects: []runtime.Object{&storagev1beta1.VolumeAttributesClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: vacName,
 				},
@@ -2475,7 +2475,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 				features.VolumeAttributesClass: true,
 			},
 			pluginCapabilities: provisionWithVACCapabilities,
-			clientSetObjects: []runtime.Object{&storagev1alpha1.VolumeAttributesClass{
+			clientSetObjects: []runtime.Object{&storagev1beta1.VolumeAttributesClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: vacName,
 				},
@@ -2630,7 +2630,7 @@ func runFSTypeProvisionTest(t *testing.T, k string, tc provisioningFSTypeTestcas
 
 func runProvisionTest(t *testing.T, tc provisioningTestcase, requestedBytes int64, provisionDriverName, supportsMigrationFromInTreePluginName string, testProvision bool) {
 	for featureName, featureValue := range tc.featureGates {
-		defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, featureName, featureValue)()
+		utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, featureName, featureValue)
 	}
 
 	tmpdir := tempDir(t)
@@ -4535,7 +4535,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 			}
 		}()
 
-		defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CrossNamespaceVolumeDataSource, tc.xnsEnabled)()
+		utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CrossNamespaceVolumeDataSource, tc.xnsEnabled)
 
 		pluginCaps, controllerCaps := provisionFromSnapshotCapabilities()
 		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn,
@@ -4611,7 +4611,7 @@ func TestProvisionFromSnapshot(t *testing.T) {
 
 // TestProvisionWithTopology is a basic test of provisioner integration with topology functions.
 func TestProvisionWithTopologyEnabled(t *testing.T) {
-	defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, true)()
+	utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, true)
 
 	const requestBytes = 100
 
@@ -4787,7 +4787,7 @@ func TestProvisionErrorHandling(t *testing.T) {
 						controllerCaps rpc.ControllerCapabilitySet
 					)
 					if driverSupportsTopology {
-						defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, true)()
+						utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, true)
 						pluginCaps, controllerCaps = provisionWithTopologyCapabilities()
 					} else {
 						pluginCaps, controllerCaps = provisionCapabilities()
@@ -4861,7 +4861,7 @@ func TestProvisionErrorHandling(t *testing.T) {
 // TestProvisionWithTopologyDisabled checks that missing Node and CSINode objects, selectedNode
 // are ignored and topology is not set on the PV
 func TestProvisionWithTopologyDisabled(t *testing.T) {
-	defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, false)()
+	utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.Topology, false)
 
 	accessibleTopology := []*csi.Topology{
 		{
@@ -6617,7 +6617,7 @@ func TestProvisionFromPVC(t *testing.T) {
 					close(stopChan)
 				}
 			}()
-			defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CrossNamespaceVolumeDataSource, tc.xnsEnabled)()
+			utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CrossNamespaceVolumeDataSource, tc.xnsEnabled)
 
 			// Phase: setup responses based on test case parameters
 			out := &csi.CreateVolumeResponse{
