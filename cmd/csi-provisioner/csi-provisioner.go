@@ -37,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -48,13 +49,17 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 	utilflag "k8s.io/component-base/cli/flag"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
+	_ "k8s.io/component-base/logs/json/register"
 	"k8s.io/component-base/metrics/legacyregistry"
 	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
-	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller/metrics"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller"
+	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller/metrics"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -63,7 +68,7 @@ import (
 	ctrl "github.com/kubernetes-csi/external-provisioner/v5/pkg/controller"
 	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
 	"github.com/kubernetes-csi/external-provisioner/v5/pkg/owner"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v6/clientset/versioned"
+	snapclientset "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
 	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayInformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 	referenceGrantv1beta1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1beta1"
@@ -131,10 +136,17 @@ func main() {
 	flag.Var(utilflag.NewMapStringBool(&featureGates), "feature-gates", "A set of key=value pairs that describe feature gates for alpha/experimental features. "+
 		"Options are:\n"+strings.Join(utilfeature.DefaultFeatureGate.KnownFeatures(), "\n"))
 
-	klog.InitFlags(nil)
+	fg := featuregate.NewFeatureGate()
+	logsapi.AddFeatureGates(fg)
+	c := logsapi.NewLoggingConfiguration()
+	logsapi.AddFlags(c, flag.CommandLine)
+	logs.InitLogs()
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
-	flag.Set("logtostderr", "true")
 	flag.Parse()
+	if err := logsapi.ValidateAndApply(c, fg); err != nil {
+		klog.ErrorS(err, "LoggingConfiguration is invalid")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
 
 	ctx := context.Background()
 
@@ -151,7 +163,7 @@ func main() {
 		fmt.Println(os.Args[0], version)
 		os.Exit(0)
 	}
-	klog.Infof("Version: %s", version)
+	klog.InfoS("Version", "version", version)
 
 	if *metricsAddress != "" && *httpEndpoint != "" {
 		klog.Error("only one of `--metrics-address` and `--http-endpoint` can be set.")
@@ -184,7 +196,9 @@ func main() {
 	config.QPS = *kubeAPIQPS
 	config.Burst = *kubeAPIBurst
 
-	clientset, err := kubernetes.NewForConfig(config)
+	coreConfig := rest.CopyConfig(config)
+	coreConfig.ContentType = runtime.ContentTypeProtobuf
+	clientset, err := kubernetes.NewForConfig(coreConfig)
 	if err != nil {
 		klog.Fatalf("Failed to create client: %v", err)
 	}
@@ -315,7 +329,7 @@ func main() {
 		if err != nil {
 			klog.Fatalf("Failed to get node info from CSI driver: %v", err)
 		}
-		nodeDeployment.NodeInfo = *nodeInfo
+		nodeDeployment.NodeInfo = nodeInfo
 	}
 
 	var nodeLister listersv1.NodeLister
@@ -597,9 +611,8 @@ func main() {
 		}()
 	}
 
-	logger := klog.FromContext(ctx)
 	provisionController = controller.NewProvisionController(
-		logger,
+		ctx,
 		clientset,
 		provisionerName,
 		csiProvisioner,
@@ -657,7 +670,7 @@ func main() {
 		lockName := strings.Replace(provisionerName, "/", "-", -1)
 
 		// create a new clientset for leader election
-		leClientset, err := kubernetes.NewForConfig(config)
+		leClientset, err := kubernetes.NewForConfig(coreConfig)
 		if err != nil {
 			klog.Fatalf("Failed to create leaderelection client: %v", err)
 		}
