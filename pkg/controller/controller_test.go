@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/go-logr/logr"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
+	"github.com/kubernetes-csi/csi-test/v5/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -47,15 +49,15 @@ import (
 	utilfeaturetesting "k8s.io/component-base/featuregate/testing"
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v10/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
 	"github.com/kubernetes-csi/csi-test/v5/driver"
 	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
-	crdv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
-	"github.com/kubernetes-csi/external-snapshotter/client/v6/clientset/versioned/fake"
+	crdv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned/fake"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	fakegateway "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 	gatewayInformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
@@ -170,7 +172,7 @@ func TestGetPluginName(t *testing.T) {
 	in := &csi.GetPluginInfoRequest{}
 	out := test.output[0]
 
-	identityServer.EXPECT().GetPluginInfo(gomock.Any(), in).Return(out, nil).Times(1)
+	identityServer.EXPECT().GetPluginInfo(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
 	oldName, err := GetDriverName(csiConn.conn, timeout)
 	if err != nil {
 		t.Errorf("test %q: Failed to get driver's name", test.name)
@@ -180,7 +182,7 @@ func TestGetPluginName(t *testing.T) {
 	}
 
 	out = test.output[1]
-	identityServer.EXPECT().GetPluginInfo(gomock.Any(), in).Return(out, nil).Times(1)
+	identityServer.EXPECT().GetPluginInfo(gomock.Any(), utils.Protobuf(in)).Return(out, nil).Times(1)
 	newName, err := GetDriverName(csiConn.conn, timeout)
 	if err != nil {
 		t.Errorf("test %s: Failed to get driver's name", test.name)
@@ -351,7 +353,7 @@ func TestGetDriverName(t *testing.T) {
 		}
 
 		// Setup expectation
-		identityServer.EXPECT().GetPluginInfo(gomock.Any(), in).Return(out, injectedErr).Times(1)
+		identityServer.EXPECT().GetPluginInfo(gomock.Any(), utils.Protobuf(in)).Return(out, injectedErr).Times(1)
 
 		name, err := GetDriverName(csiConn.conn, timeout)
 		if test.expectError && err == nil {
@@ -450,9 +452,9 @@ func TestCreateDriverReturnsInvalidCapacityDuringProvision(t *testing.T) {
 	// Set up Mocks
 	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 	// Since capacity returned by driver is invalid, we expect the provision call to clean up the volume
-	controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
+	controllerServer.EXPECT().DeleteVolume(gomock.Any(), utils.Protobuf(&csi.DeleteVolumeRequest{
 		VolumeId: "test-volume-id",
-	}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+	})).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
 
 	// Call provision
 	_, _, err = csiProvisioner.Provision(context.Background(), opts)
@@ -2279,7 +2281,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 			},
 			expectErr:          true,
 			expectState:        controller.ProvisioningNoChange,
-			expectNoProvision:  true,         // not owner yet
+			expectNoProvision:  true,         // notowner yet
 			expectSelectedNode: nodeFoo.Name, // changed by ShouldProvision
 		},
 		"distributed immediate, allowed topologies not okay": {
@@ -4558,9 +4560,9 @@ func TestProvisionFromSnapshot(t *testing.T) {
 			if tc.notPopulated {
 				out.Volume.ContentSource = nil
 				controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
-				controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
+				controllerServer.EXPECT().DeleteVolume(gomock.Any(), utils.Protobuf(&csi.DeleteVolumeRequest{
 					VolumeId: "test-volume-id",
-				}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+				})).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
 			} else {
 				snapshotSource := csi.VolumeContentSource_Snapshot{
 					Snapshot: &csi.VolumeContentSource_SnapshotSource{
@@ -5539,7 +5541,7 @@ func runDeleteTest(t *testing.T, k string, tc deleteTestcase) {
 		nodeDeployment = &NodeDeployment{
 			NodeName:      tc.deploymentNode,
 			ClaimInformer: claimInformer,
-			NodeInfo: csi.NodeGetInfoResponse{
+			NodeInfo: &csi.NodeGetInfoResponse{
 				NodeId: tc.deploymentNode,
 				AccessibleTopology: &csi.Topology{
 					Segments: map[string]string{
@@ -6659,9 +6661,9 @@ func TestProvisionFromPVC(t *testing.T) {
 				controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 				// if the volume created is less than the requested size,
 				// deletevolume will be called
-				controllerServer.EXPECT().DeleteVolume(gomock.Any(), &csi.DeleteVolumeRequest{
+				controllerServer.EXPECT().DeleteVolume(gomock.Any(), utils.Protobuf(&csi.DeleteVolumeRequest{
 					VolumeId: "test-volume-id",
-				}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+				})).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
 			}
 
 			_, _, _, claimLister, _, _ := listers(clientSet)
@@ -6808,8 +6810,8 @@ func TestProvisionWithMigration(t *testing.T) {
 
 			// Have fake translation provide same as input SC but with
 			// Parameter indicating it has been translated
-			mockTranslator.EXPECT().TranslateInTreeStorageClassToCSI(gomock.Any(), gomock.Any()).DoAndReturn(
-				func(_ string, sc *storagev1.StorageClass) (*storagev1.StorageClass, error) {
+			mockTranslator.EXPECT().TranslateInTreeStorageClassToCSI(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ logr.Logger, _ string, sc *storagev1.StorageClass) (*storagev1.StorageClass, error) {
 					newSC := sc.DeepCopy()
 					newSC.Parameters[translatedKey] = "foo"
 					return newSC, nil
@@ -6838,14 +6840,14 @@ func TestProvisionWithMigration(t *testing.T) {
 					expectParams[translatedKey] = "foo"
 				}
 				controllerServer.EXPECT().CreateVolume(gomock.Any(),
-					&csi.CreateVolumeRequest{
+					utils.Protobuf(&csi.CreateVolumeRequest{
 						Name:               "test-testi",
 						Parameters:         expectParams,
 						VolumeCapabilities: nil,
 						CapacityRange: &csi.CapacityRange{
 							RequiredBytes: int64(requestBytes),
 						},
-					}).Return(
+					})).Return(
 					&csi.CreateVolumeResponse{
 						Volume: &csi.Volume{
 							CapacityBytes: requestBytes,
@@ -6985,8 +6987,8 @@ func TestDeleteMigration(t *testing.T) {
 			if tc.expectTranslation {
 				// In the translation case we translate to CSI we return a fake
 				// PV with a different handle
-				mockTranslator.EXPECT().TranslateInTreePVToCSI(gomock.Any()).Return(createFakeCSIPV(translatedHandle), nil).AnyTimes()
-				mockTranslator.EXPECT().TranslateInTreeStorageClassToCSI(gomock.Any(), gomock.Any()).Return(tc.sc, nil).AnyTimes()
+				mockTranslator.EXPECT().TranslateInTreePVToCSI(gomock.Any(), gomock.Any()).Return(createFakeCSIPV(translatedHandle), nil).AnyTimes()
+				mockTranslator.EXPECT().TranslateInTreeStorageClassToCSI(gomock.Any(), gomock.Any(), gomock.Any()).Return(tc.sc, nil).AnyTimes()
 			}
 
 			volID := normalHandle
@@ -6997,9 +6999,9 @@ func TestDeleteMigration(t *testing.T) {
 			// We assert that the Delete is called on the driver with either the
 			// normal or the translated handle
 			controllerServer.EXPECT().DeleteVolume(gomock.Any(),
-				&csi.DeleteVolumeRequest{
+				utils.Protobuf(&csi.DeleteVolumeRequest{
 					VolumeId: volID,
-				}).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
+				})).Return(&csi.DeleteVolumeResponse{}, nil).Times(1)
 
 			// Run Delete
 			err = csiProvisioner.Delete(context.Background(), tc.pv)
