@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -53,8 +55,8 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v11/util"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v13/util"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -247,7 +249,7 @@ type NodeDeployment struct {
 
 type internalNodeDeployment struct {
 	NodeDeployment
-	rateLimiter workqueue.RateLimiter
+	rateLimiter workqueue.TypedRateLimiter[any]
 }
 
 type csiProvisioner struct {
@@ -278,6 +280,7 @@ type csiProvisioner struct {
 	nodeDeployment                        *internalNodeDeployment
 	controllerPublishReadOnly             bool
 	preventVolumeModeConversion           bool
+	pvcNodeStore                          TopologyProvider
 }
 
 var (
@@ -359,6 +362,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	nodeDeployment *NodeDeployment,
 	controllerPublishReadOnly bool,
 	preventVolumeModeConversion bool,
+	pvcNodeStore TopologyProvider,
 ) controller.Provisioner {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(klog.Infof)
@@ -394,6 +398,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		eventRecorder:                         eventRecorder,
 		controllerPublishReadOnly:             controllerPublishReadOnly,
 		preventVolumeModeConversion:           preventVolumeModeConversion,
+		pvcNodeStore:                          pvcNodeStore,
 	}
 	if nodeDeployment != nil {
 		provisioner.nodeDeployment = &internalNodeDeployment{
@@ -402,7 +407,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		}
 		// Remove deleted PVCs from rate limiter.
 		claimHandler := cache.ResourceEventHandlerFuncs{
-			DeleteFunc: func(obj interface{}) {
+			DeleteFunc: func(obj any) {
 				if unknown, ok := obj.(cache.DeletedFinalStateUnknown); ok && unknown.Obj != nil {
 					obj = unknown.Obj
 				}
@@ -458,7 +463,7 @@ func makeVolumeName(prefix, pvcUID string, volumeNameUUIDLength int) (string, er
 	// create persistent name based on a volumeNamePrefix and volumeNameUUIDLength
 	// of PVC's UID
 	if len(prefix) == 0 {
-		return "", fmt.Errorf("Volume name prefix cannot be of length 0")
+		return "", fmt.Errorf("volume name prefix cannot be of length 0")
 	}
 	if len(pvcUID) == 0 {
 		return "", fmt.Errorf("corrupted PVC object, it is missing UID")
@@ -549,7 +554,7 @@ type prepareProvisionResult struct {
 }
 
 // prepareProvision does non-destructive parameter checking and preparations for provisioning a volume.
-func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.PersistentVolumeClaim, sc *storagev1.StorageClass, selectedNode *v1.Node) (*prepareProvisionResult, controller.ProvisioningState, error) {
+func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.PersistentVolumeClaim, sc *storagev1.StorageClass, selectedNodeName string) (*prepareProvisionResult, controller.ProvisioningState, error) {
 	if sc == nil {
 		return nil, controller.ProvisioningFinished, errors.New("storage class was nil")
 	}
@@ -677,7 +682,7 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 	}
 
 	if dataSource != nil && rc.clone {
-		err = p.setCloneFinalizer(ctx, claim, dataSource)
+		err = p.setCloneFinalizer(ctx, dataSource)
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, err
 		}
@@ -687,13 +692,15 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 		requirements, err := GenerateAccessibilityRequirements(
 			p.client,
 			p.driverName,
+			claim.UID,
 			claim.Name,
 			sc.AllowedTopologies,
-			selectedNode,
+			selectedNodeName,
 			p.strictTopology,
 			p.immediateTopology,
 			p.csiNodeLister,
-			p.nodeLister)
+			p.nodeLister,
+			p.pvcNodeStore)
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, fmt.Errorf("error generating accessibility requirements: %v", err)
 		}
@@ -761,7 +768,7 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 	}
 
 	if vacName != "" {
-		vac, err := p.client.StorageV1beta1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
+		vac, err := p.client.StorageV1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, err
 		}
@@ -813,7 +820,7 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		}
 	}
 
-	result, state, err := p.prepareProvision(ctx, claim, options.StorageClass, options.SelectedNode)
+	result, state, err := p.prepareProvision(ctx, claim, options.StorageClass, options.SelectedNodeName)
 	if result == nil {
 		return nil, state, err
 	}
@@ -842,14 +849,18 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		// even drivers which did not ask for it explicitly might still only look at the first
 		// topology entry and thus succeed after rescheduling.
 		mayReschedule := p.supportsTopology() &&
-			options.SelectedNode != nil
+			len(options.SelectedNodeName) > 0
 		state := checkError(err, mayReschedule)
 		klog.V(5).Infof("CreateVolume failed, supports topology = %v, node selected %v => may reschedule = %v => state = %v: %v",
 			p.supportsTopology(),
-			options.SelectedNode != nil,
+			options.SelectedNodeName,
 			mayReschedule,
 			state,
 			err)
+		// Delete the entry in in memory cache if the error is final
+		if p.supportsTopology() && (state == controller.ProvisioningFinished || state == controller.ProvisioningReschedule) {
+			p.pvcNodeStore.Delete(claim.UID)
+		}
 		return nil, state, err
 	}
 
@@ -857,9 +868,7 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		klog.V(3).Infof("create volume rep: %+v", rep.Volume)
 	}
 	volumeAttributes := map[string]string{provisionerIDKey: p.identity}
-	for k, v := range rep.Volume.VolumeContext {
-		volumeAttributes[k] = v
-	}
+	maps.Copy(volumeAttributes, rep.Volume.VolumeContext)
 	respCap := rep.GetVolume().GetCapacityBytes()
 
 	// According to CSI spec CreateVolume should be able to return capacity = 0, which means it is unknown. for example NFS/FTP
@@ -973,10 +982,14 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 	}
 
 	klog.V(5).Infof("successfully created PV %+v", pv.Spec.PersistentVolumeSource)
+	// Remove entry from the in memory cache
+	if p.supportsTopology() {
+		p.pvcNodeStore.Delete(claim.UID)
+	}
 	return pv, controller.ProvisioningFinished, nil
 }
 
-func (p *csiProvisioner) setCloneFinalizer(ctx context.Context, pvc *v1.PersistentVolumeClaim, dataSource *v1.ObjectReference) error {
+func (p *csiProvisioner) setCloneFinalizer(ctx context.Context, dataSource *v1.ObjectReference) error {
 	claim, err := p.claimLister.PersistentVolumeClaims(dataSource.Namespace).Get(dataSource.Name)
 	if err != nil {
 		return err
@@ -1169,7 +1182,7 @@ func (p *csiProvisioner) getSnapshotSource(ctx context.Context, claim *v1.Persis
 		return nil, fmt.Errorf(snapshotNotBound, dataSource.Name)
 	}
 
-	if snapshotObj.Status.ReadyToUse == nil || *snapshotObj.Status.ReadyToUse == false {
+	if snapshotObj.Status.ReadyToUse == nil || !*snapshotObj.Status.ReadyToUse {
 		return nil, fmt.Errorf("snapshot %s is not Ready", dataSource.Name)
 	}
 
@@ -1481,7 +1494,7 @@ func (p *csiProvisioner) checkNode(ctx context.Context, claim *v1.PersistentVolu
 		// it must match our own. We can find out by trying to
 		// create accessibility requirements.  If that fails,
 		// we should not become the owner.
-		if len(sc.AllowedTopologies) > 0 {
+		if len(sc.AllowedTopologies) > 0 && p.supportsTopology() {
 			node, err := p.nodeLister.Get(p.nodeDeployment.NodeName)
 			if err != nil {
 				return false, err
@@ -1489,13 +1502,15 @@ func (p *csiProvisioner) checkNode(ctx context.Context, claim *v1.PersistentVolu
 			if _, err := GenerateAccessibilityRequirements(
 				p.client,
 				p.driverName,
+				claim.UID,
 				claim.Name,
 				sc.AllowedTopologies,
-				node,
+				node.Name,
 				p.strictTopology,
 				p.immediateTopology,
 				p.csiNodeLister,
-				p.nodeLister); err != nil {
+				p.nodeLister,
+				p.pvcNodeStore); err != nil {
 				if logger.Enabled() {
 					logger.Infof("%s: ignoring PVC %s/%s, allowed topologies is not compatible: %v", caller, claim.Namespace, claim.Name, err)
 				}
@@ -1550,7 +1565,7 @@ func (p *csiProvisioner) checkCapacity(ctx context.Context, claim *v1.Persistent
 		return false, err
 	}
 
-	result, _, err := p.prepareProvision(ctx, claim, sc, node)
+	result, _, err := p.prepareProvision(ctx, claim, sc, node.Name)
 	if err != nil {
 		return false, err
 	}
@@ -1596,10 +1611,7 @@ func (nc *internalNodeDeployment) becomeOwner(ctx context.Context, p *csiProvisi
 	// With multiple provisioners running in parallel, it becomes more
 	// likely that one of them became the owner quickly, so we don't
 	// want to check too slowly either.
-	pollInterval := nc.BaseDelay / 100
-	if pollInterval < 10*time.Millisecond {
-		pollInterval = 10 * time.Millisecond
-	}
+	pollInterval := max(nc.BaseDelay/100, 10*time.Millisecond)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	check := func() (bool, *v1.PersistentVolumeClaim, error) {
@@ -1919,7 +1931,7 @@ func cleanupVolume(ctx context.Context, p *csiProvisioner, delReq *csi.DeleteVol
 	delReq.Secrets = provisionerCredentials
 	deleteCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	for i := 0; i < deleteVolumeRetryCount; i++ {
+	for range deleteVolumeRetryCount {
 		_, err = p.csiClient.DeleteVolume(deleteCtx, delReq)
 		if err == nil {
 			break
@@ -1929,12 +1941,7 @@ func cleanupVolume(ctx context.Context, p *csiProvisioner, delReq *csi.DeleteVol
 }
 
 func checkFinalizer(obj metav1.Object, finalizer string) bool {
-	for _, f := range obj.GetFinalizers() {
-		if f == finalizer {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(obj.GetFinalizers(), finalizer)
 }
 
 func markAsMigrated(parent context.Context, hasMigrated bool) context.Context {

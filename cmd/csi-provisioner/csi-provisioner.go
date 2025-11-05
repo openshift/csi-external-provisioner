@@ -26,6 +26,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -40,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
+	server "k8s.io/apiserver/pkg/server"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -58,8 +60,8 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller"
-	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller/metrics"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller"
+	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller/metrics"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -142,8 +144,8 @@ func main() {
 	c := logsapi.NewLoggingConfiguration()
 	logsapi.AddFlags(c, flag.CommandLine)
 	logs.InitLogs()
-	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	standardflags.AddAutomaxprocs(klog.Infof)
+	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.Parse()
 	if err := logsapi.ValidateAndApply(c, fg); err != nil {
 		klog.ErrorS(err, "LoggingConfiguration is invalid")
@@ -203,6 +205,18 @@ func main() {
 	clientset, err := kubernetes.NewForConfig(coreConfig)
 	if err != nil {
 		klog.Fatalf("Failed to create client: %v", err)
+	}
+
+	if !utilfeature.DefaultMutableFeatureGate.ExplicitlySet(features.VolumeAttributesClass) {
+		volumeAttributesClassV1Enabled, err := features.IsVolumeAttributesClassV1Enabled(clientset.Discovery())
+		if err == nil && !volumeAttributesClassV1Enabled {
+			if utilfeature.DefaultMutableFeatureGate.Enabled(features.VolumeAttributesClass) {
+				klog.InfoS("Disabling VolumeAttributesClass feature gate because the VolumeAttributesClass v1 API is not available")
+				if err := utilfeature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=false", features.VolumeAttributesClass)); err != nil {
+					klog.Fatalf("Failed to disable VolumeAttributesClass feature gate: %v", err)
+				}
+			}
+		}
 	}
 
 	// snapclientset.NewForConfig creates a new Clientset for  VolumesnapshotV1Client
@@ -392,8 +406,9 @@ func main() {
 
 	// -------------------------------
 	// PersistentVolumeClaims informer
-	rateLimiter := workqueue.NewItemExponentialFailureRateLimiter(*retryIntervalStart, *retryIntervalMax)
-	claimQueue := workqueue.NewNamedRateLimitingQueue(rateLimiter, "claims")
+	genericRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
+	claimRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
+	claimQueue := workqueue.NewTypedRateLimitingQueueWithConfig(claimRateLimiter, workqueue.TypedRateLimitingQueueConfig[string]{Name: "claims"})
 	claimInformer := factory.Core().V1().PersistentVolumeClaims().Informer()
 
 	// Setup options
@@ -401,11 +416,11 @@ func main() {
 		controller.LeaderElection(false), // Always disable leader election in provisioner lib. Leader election should be done here in the CSI provisioner level instead.
 		controller.FailedProvisionThreshold(0),
 		controller.FailedDeleteThreshold(0),
-		controller.RateLimiter(rateLimiter),
+		controller.RateLimiter(genericRateLimiter),
 		controller.Threadiness(int(*workerThreads)),
-		controller.CreateProvisionedPVLimiter(workqueue.DefaultControllerRateLimiter()),
+		controller.CreateProvisionedPVLimiter(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		controller.ClaimsInformer(claimInformer),
-		controller.NodesLister(nodeLister),
+		controller.RetryIntervalMax(*retryIntervalMax),
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.HonorPVReclaimPolicy) {
@@ -414,6 +429,10 @@ func main() {
 
 	if supportsMigrationFromInTreePluginName != "" {
 		provisionerOptions = append(provisionerOptions, controller.AdditionalProvisionerNames([]string{supportsMigrationFromInTreePluginName}))
+	}
+	var pvcNodeStore *ctrl.InMemoryStore
+	if ctrl.SupportsTopology(pluginCapabilities) {
+		pvcNodeStore = ctrl.NewInMemoryStore()
 	}
 
 	// Create the provisioner: it implements the Provisioner interface expected by
@@ -444,6 +463,7 @@ func main() {
 		nodeDeployment,
 		*controllerPublishReadOnly,
 		*preventVolumeModeConversion,
+		pvcNodeStore,
 	)
 
 	var capacityController *capacity.Controller
@@ -473,7 +493,8 @@ func main() {
 					Group:   "",
 					Version: "v1",
 					Kind:    "Pod",
-				}, *capacityOwnerrefLevel)
+				},
+				*capacityOwnerrefLevel)
 			if err != nil {
 				klog.Fatalf("look up owner(s) of pod: %v", err)
 			}
@@ -482,12 +503,13 @@ func main() {
 
 		var topologyInformer topology.Informer
 		if nodeDeployment == nil {
+			topologyRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
 			topologyInformer = topology.NewNodeTopology(
 				provisionerName,
 				clientset,
 				factory.Core().V1().Nodes(),
 				factory.Storage().V1().CSINodes(),
-				workqueue.NewNamedRateLimitingQueue(rateLimiter, "csitopology"),
+				workqueue.NewTypedRateLimitingQueueWithConfig(topologyRateLimiter, workqueue.TypedRateLimitingQueueConfig[string]{Name: "csitopology"}),
 			)
 		} else {
 			var segment topology.Segment
@@ -547,12 +569,13 @@ func main() {
 			klog.Fatalf("unexpected error when checking for the V1 CSIStorageCapacity API: %v", err)
 		}
 
+		capacityRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[capacity.QueueKey](*retryIntervalStart, *retryIntervalMax)
 		capacityController = capacity.NewCentralCapacityController(
 			csi.NewControllerClient(grpcClient),
 			provisionerName,
 			clientFactory,
 			// Metrics for the queue is available in the default registry.
-			workqueue.NewNamedRateLimitingQueue(rateLimiter, "csistoragecapacity"),
+			workqueue.NewTypedRateLimitingQueueWithConfig(capacityRateLimiter, workqueue.TypedRateLimitingQueueConfig[capacity.QueueKey]{Name: "csistoragecapacity"}),
 			controller,
 			managedByID,
 			namespace,
@@ -593,7 +616,8 @@ func main() {
 		mux.Handle(*metricsPath,
 			promhttp.InstrumentMetricHandler(
 				reg,
-				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})))
+				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}),
+			))
 
 		if *enableProfile {
 			klog.InfoS("Starting profiling", "endpoint", httpEndpoint)
@@ -629,7 +653,31 @@ func main() {
 		controllerCapabilities,
 	)
 
+	// handle SIGTERM and SIGINT by cancelling the context.
+	var (
+		terminate       func()          // called when all controllers are finished
+		controllerCtx   context.Context // shuts down all controllers on a signal
+		shutdownHandler <-chan struct{} // called when the signal is received
+	)
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+		// ctx waits for all controllers to finish, then shuts down the whole process, incl. leader election
+		ctx, terminate = context.WithCancel(ctx)
+		var cancelControllerCtx context.CancelFunc
+		controllerCtx, cancelControllerCtx = context.WithCancel(ctx)
+		shutdownHandler = server.SetupSignalHandler()
+
+		defer terminate()
+
+		go func() {
+			defer cancelControllerCtx()
+			<-shutdownHandler
+			klog.Info("Received SIGTERM or SIGINT signal, shutting down controller.")
+		}()
+	}
+
 	run := func(ctx context.Context) {
+
 		factory.Start(ctx.Done())
 		if factoryForNamespace != nil {
 			// Starting is enough, the capacity controller will
@@ -655,13 +703,35 @@ func main() {
 			}
 		}
 
-		if capacityController != nil {
-			go capacityController.Run(ctx, int(*capacityThreads))
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+			var wg sync.WaitGroup
+			if capacityController != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					capacityController.Run(controllerCtx, int(*capacityThreads), &wg)
+				}()
+			}
+			if csiClaimController != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					csiClaimController.Run(controllerCtx, int(*finalizerThreads), &wg)
+				}()
+			}
+			provisionController.ControllerWaitGroup(&wg)
+			provisionController.Run(controllerCtx)
+			wg.Wait()
+			terminate()
+		} else {
+			if capacityController != nil {
+				go capacityController.Run(ctx, int(*capacityThreads), nil)
+			}
+			if csiClaimController != nil {
+				go csiClaimController.Run(ctx, int(*finalizerThreads), nil)
+			}
+			provisionController.Run(ctx)
 		}
-		if csiClaimController != nil {
-			go csiClaimController.Run(ctx, int(*finalizerThreads))
-		}
-		provisionController.Run(ctx)
 	}
 
 	if !*enableLeaderElection {
@@ -690,6 +760,10 @@ func main() {
 		le.WithRenewDeadline(*leaderElectionRenewDeadline)
 		le.WithRetryPeriod(*leaderElectionRetryPeriod)
 		le.WithIdentity(identity)
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+			le.WithReleaseOnCancel(true)
+			le.WithContext(ctx)
+		}
 
 		if err := le.Run(); err != nil {
 			klog.Fatalf("failed to initialize leader election: %v", err)

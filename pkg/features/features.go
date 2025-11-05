@@ -17,6 +17,9 @@ limitations under the License.
 package features
 
 import (
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/discovery"
+
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 )
@@ -48,9 +51,16 @@ const (
 	// kep: https://kep.k8s.io/3751
 	// alpha: v1.29
 	// beta: v1.31
+	// GA: v1.34
 	//
 	// Pass VolumeAttributesClass parameters to supporting CSI drivers during CreateVolume
 	VolumeAttributesClass featuregate.Feature = "VolumeAttributesClass"
+
+	// owner: @rhrmo
+	// alpha: v1.34
+	//
+	// Releases leader election lease on sigterm / sigint.
+	ReleaseLeaderElectionOnExit featuregate.Feature = "ReleaseLeaderElectionOnExit"
 )
 
 func init() {
@@ -63,5 +73,27 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	Topology:                       {Default: true, PreRelease: featuregate.GA},
 	HonorPVReclaimPolicy:           {Default: true, PreRelease: featuregate.GA, LockToDefault: true},
 	CrossNamespaceVolumeDataSource: {Default: false, PreRelease: featuregate.Alpha},
-	VolumeAttributesClass:          {Default: false, PreRelease: featuregate.Beta},
+	VolumeAttributesClass:          {Default: true, PreRelease: featuregate.GA},
+	ReleaseLeaderElectionOnExit:    {Default: false, PreRelease: featuregate.Alpha},
+}
+
+// IsVolumeAttributesClassV1Enabled checks if the VolumeAttributesClass v1 API is enabled.
+func IsVolumeAttributesClassV1Enabled(d discovery.DiscoveryInterface) (bool, error) {
+	return resourceExists(d, "storage.k8s.io/v1", "VolumeAttributesClass")
+}
+
+func resourceExists(d discovery.DiscoveryInterface, groupVersion, kind string) (bool, error) {
+	res, err := d.ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, r := range res.APIResources {
+		if r.Kind == kind {
+			return true, nil
+		}
+	}
+	return false, nil
 }
