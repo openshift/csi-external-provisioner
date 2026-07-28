@@ -27,7 +27,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
-	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
+	"github.com/kubernetes-csi/external-provisioner/v6/pkg/features"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -550,7 +550,7 @@ func extractTopologyTerm(labels map[string]string, topologyKeys []string) (topol
 	for _, key := range topologyKeys {
 		v, ok := labels[key]
 		if !ok {
-			return nil, nil, true // isMissingKey = true
+			return nil, labels, true // isMissingKey = true
 		}
 		term = append(term, topologySegment{key, v})
 	}
@@ -562,16 +562,21 @@ func getTopologyFromNodeName(nodeName string, topologyKeys []string, nodeLister 
 	// Read from the cache first.
 	nodeLabels, err := getNodeLabelsFromCache(pvcNodeStore, pvcKeyForStore)
 	if err == nil && len(nodeLabels) > 0 {
-		return extractTopologyTerm(nodeLabels, topologyKeys)
+		selectedTopology, selectedNodeLabels, isMissingKey := extractTopologyTerm(nodeLabels, topologyKeys)
+		if !isMissingKey {
+			return selectedTopology, selectedNodeLabels, isMissingKey
+		}
+		// If required topology keys are missing, refresh node labels from nodeLister
+		// to avoid using stale or incomplete entries from pvcNodeStore.
 	}
 
-	// Get Node from API server.
+	// Get Node from informer cache.
 	if nodeLister != nil {
 		node, err := nodeLister.Get(nodeName)
 		if err != nil {
 			// Any error, including NotFound, results in us not being
 			// able to determine topology. The cache was already checked.
-			return nil, nil, true
+			return nil, nodeLabels, true
 		}
 
 		// Add or update cache for the node.
